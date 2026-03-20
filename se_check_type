@@ -1,0 +1,322 @@
+#!/usr/bin/python3
+
+######
+# SPDX-FileCopyrightText:  © Hewlett Packard Enterprise Development LP
+# SPDX-License-Identifier:  MIT
+######
+
+######
+## Author :
+## Basile Leretaille
+######
+
+######
+# Copyright (c) 2026 Hewlett Packard Enterprise Development LP
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy 
+# of this software and associated documentation files (the “Software”), to deal 
+# in the Software without restriction, including without limitation the rights 
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell 
+# copies of the Software, and to permit persons to whom the Software is 
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in 
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR 
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, 
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE 
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER 
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, 
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE 
+# SOFTWARE.
+######
+
+######
+## This script take a SELinux policy file (written in "human readable/explicit" format '.te' : 'module X; require {...} ...') and assert every types exists on the host ; it doesn't resolve internal incoherencies.
+## If a type doesn't exists, it either print it, remove it from the policy, or loads a new policy that creates it.
+## When creating a type, the policy module name will be the missing type; and the files will be created in the same folder as the policy analyzed.
+######
+
+######
+## Usage example :
+## se_check_type --policy myapp.te [ -r | -c ] [ -d ]
+######
+
+
+import argparse
+import re
+import subprocess
+import os
+import sys
+
+
+parser = argparse.ArgumentParser(
+    description="Assert the types required in a SELinux policy exist."
+)
+parser.add_argument("--policy", required=True, help="Path to the policy file")
+parser.add_argument("-d", action="store_true", help="Show debug")
+parser.add_argument("-c", action="store_true", help="Create and load the missing types")
+parser.add_argument("-r", action="store_true", help="Remove the missing types from the policy")
+parser.add_argument(
+    "--ignore", nargs="*", default=[], metavar="TYPE",
+    help="Space-separated types to skip (skips existence check and rule analysis; "
+         "use with caution as it can lead to policy loading errors)",
+)
+args = parser.parse_args()
+
+# config: default vars
+debug = False
+create = False
+remove = False
+# if needed, this indent will be used to recreate the indent for the 'type' line in the require block of the policy
+require_indent = "    "
+# these types will be ignored ; use with cautious as it can lead to errors in the policy loading
+ignored_types = []
+# the template used to create new types
+policy_template = "module {type_name} 1.0; type {type_name}; require {{ type {type_name}; }}"
+REGEX_GET_FIRST_TYPE = re.compile(r"type (\S+)(?:.*?);")
+REGEX_TYPES_LINE = re.compile(r"type (.*?);")
+REGEX_SEINFO_ALIASES = re.compile(r"alias (\S+|\{.+?\}),")
+REGEX_SET_CONTENT = re.compile(r'\{([^}]*)\}')
+# matches SELinux type identifiers (conventionally ending in _t) in rule bodies
+REGEX_TYPE_TOKEN = re.compile(r'\b(\w+_t)\b')
+# valid SELinux type name: word characters only (prevents path traversal in -c mode)
+REGEX_VALID_TYPE_NAME = re.compile(r'^\w+$')
+
+# global vars
+doc = ""
+policy_path = ""
+created_counter = 0
+removed_types = set()
+changed_types = set()
+aliases = {}
+existing_types = set()
+existing_types_and_aliases = set()
+
+
+def debug_print(txt):
+    if debug:
+        print(txt)
+def error_print(txt):
+    print(txt, file=sys.stderr)
+def info_print(txt):
+    print(txt)
+
+
+def _get_require_block_indices(doc_str):
+    """Locate the require block in the document and return its start and end indices."""
+    rb_start = doc_str.find("require {")
+    if rb_start < 0:
+        raise ValueError("_rewrite_require_types: 'require {' block is required but not found in document")
+    depth, rb_end = 0, -1
+    for i, ch in enumerate(doc_str[rb_start:], rb_start):
+        if ch == '{':
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0:
+                rb_end = i
+                break
+    if rb_end < 0:
+        raise ValueError("_rewrite_require_types: 'require {' block is never closed in document")
+    return rb_start, rb_end
+
+def _rewrite_require_types(doc_str, sorted_types, indent):
+    """Replace ALL type declarations inside the require block with a single sorted line.
+
+    Handles policies with multiple 'type ...;' declarations in their require block,
+    consolidating them into one canonical line.  Returns the updated document string.
+    """
+    rb_start, rb_end = _get_require_block_indices(doc_str)
+    old_block = doc_str[rb_start:rb_end + 1]
+    # Remove every existing 'type ...;' line, then insert one consolidated line
+    new_block = re.sub(r'[ \t]*type[^;]+;\n?', '', old_block)
+    new_block = new_block.replace(
+        "require {",
+        "require {\n" + indent + "type " + ", ".join(sorted_types) + ";",
+        1,
+    )
+    return doc_str[:rb_start] + new_block + doc_str[rb_end + 1:]
+
+
+# check args
+if args.d:
+    debug = True
+if args.c:
+    create = True
+if args.r:
+    remove = True
+if args.ignore:
+    ignored_types = args.ignore
+if remove and create:
+    error_print("remove (-r) and create (-c) are not compatible")
+    sys.exit(1)
+if create and os.getuid() != 0:
+    error_print("error: -c requires root privileges (semodule -i modifies the system-wide SELinux policy)")
+    sys.exit(1)
+policy_path = args.policy
+with open(policy_path, "r") as file:
+    doc = file.read()
+
+
+# parse the policy
+doc_lines = doc.split("\n")
+created_types = [type_name for type_name in REGEX_GET_FIRST_TYPE.findall(doc.split("require")[0])]
+rb_start, rb_end = _get_require_block_indices(doc)
+_require_block_str = doc[rb_start:rb_end + 1]
+# collect types from ALL type declarations in the require block (not just the first line)
+required_types = {
+    t.strip()
+    for type_line in REGEX_TYPES_LINE.findall(_require_block_str)
+    for t in type_line.split(",")
+    if t.strip()
+}
+if not required_types:
+    error_print("error in parsing the policy file, no types found in require block")
+    sys.exit(1)
+if created_types:
+    debug_print(f"the policy creates by itself: '{', '.join(created_types)}' ; ignoring them")
+# compute other basic informations
+if ignored_types:
+    info_print(f"ignoring the following types: '{', '.join(ignored_types)}'\nwarning: loading of the policy might fail")
+dirname = os.path.dirname(policy_path)
+if dirname == "":
+    dirname = "./"
+else:
+    dirname += "/"
+if create:
+    debug_print(f"new types will be created in: '{dirname}'")
+
+# retrieve types and aliases from the host
+_seinfo_result = subprocess.run(["seinfo", "-t", "-x"], capture_output=True, text=True)
+if _seinfo_result.returncode != 0:
+    error_print(f"error: 'seinfo -t -x' failed (exit code {_seinfo_result.returncode})")
+    if _seinfo_result.stderr.strip():
+        error_print(_seinfo_result.stderr.strip())
+    sys.exit(1)
+for line in REGEX_TYPES_LINE.findall(_seinfo_result.stdout):
+    type_name = line.split()[0].strip(",")
+    existing_types_and_aliases.add(type_name)
+    existing_types.add(type_name)
+    match = None
+    match = REGEX_SEINFO_ALIASES.search(line)
+    if match:
+        alias_group = match.group(1)
+        if alias_group.startswith("{"):
+            for alias in alias_group.strip("}{").split():
+                existing_types_and_aliases.add(alias)
+                aliases[alias] = type_name
+        else:
+            existing_types_and_aliases.add(alias_group)
+            aliases[alias_group] = type_name
+if not existing_types:
+    error_print("error: 'seinfo' returned no types; verify setools is installed and a policy is loaded")
+    sys.exit(1)
+
+# check coherency between the require block and the actual rule body
+# reuse the already-computed require-block boundaries from parsing above
+rule_body = doc[rb_end + 1:]
+types_used_in_rules = set(REGEX_TYPE_TOKEN.findall(rule_body))
+_skip = set(ignored_types) | set(created_types)
+declared_but_unused = (required_types - types_used_in_rules) - _skip
+used_but_undeclared = (types_used_in_rules - required_types - _skip) & existing_types_and_aliases
+if declared_but_unused:
+    for _t in sorted(declared_but_unused):
+        info_print(f"warning: '{_t}' is declared in require but not used in any rule")
+if used_but_undeclared:
+    for _t in sorted(used_but_undeclared):
+        info_print(f"warning: '{_t}' is used in rules but not declared in require")
+
+# check if the types required match the ones found on the host
+for type_name in required_types:
+    type_re = re.compile(rf"\b{re.escape(type_name)}\b")
+    if (
+        type_name not in ignored_types + created_types
+        and type_name not in existing_types_and_aliases
+    ):
+        if create:
+            if not REGEX_VALID_TYPE_NAME.match(type_name):
+                error_print(f"error: type name '{type_name}' contains invalid characters, skipping")
+                continue
+            with open(f"{dirname}{type_name}.te", "w") as file:
+                file.write(policy_template.format(type_name=type_name))
+            cmd_passes = subprocess.run(
+                [ "checkmodule", "-M", "-m", "-o", f"{dirname}{type_name}.mod", f"{dirname}{type_name}.te" ]
+            ).returncode == 0
+            cmd_passes = cmd_passes and subprocess.run(
+                [ "semodule_package", "-o", f"{dirname}{type_name}.pp", "-m", f"{dirname}{type_name}.mod" ]
+            ).returncode == 0
+            cmd_passes = cmd_passes and subprocess.run(
+                ["semodule", "-i", f"{dirname}{type_name}.pp"]
+            ).returncode == 0
+            if cmd_passes:
+                debug_print(f"created '{type_name}'")
+                created_counter += 1
+            else:
+                error_print(f"error creating '{type_name}'")
+        elif remove:
+            rm_count = 0
+            tmp_lines = []
+            for line in doc_lines:
+                if type_re.search(line) is not None:
+                    # print(f"removing '{line}' as the procedure")
+                    if not line.strip().startswith("type "):
+                        # If the type is inside a { ... } set with other members, only remove
+                        # the type from that set rather than discarding the whole line.
+                        # This handles rules like: role r types { good_t missing_t other_t };
+                        set_match = REGEX_SET_CONTENT.search(line)
+                        if set_match and type_re.search(set_match.group(1)):
+                            new_set = ' '.join(type_re.sub('', set_match.group(1)).split())
+                            if new_set:
+                                new_line = line[:set_match.start(1)] + ' ' + new_set + ' ' + line[set_match.end(1):]
+                                tmp_lines.append(new_line)
+                                debug_print(f"removed '{type_name}' from set in: '{line.strip()}'")
+                            else:
+                                rm_count += 1
+                                debug_print(f"removed line with now-empty set (was: '{line.strip()}')")
+                        else:
+                            rm_count += 1
+                            debug_print(f"removed line with non-existing type (was: '{line.strip()}')")
+                else:
+                    tmp_lines.append(line)
+            doc_lines = tmp_lines.copy()
+            removed_types.add(type_name)
+            debug_print(f"removed '{type_name}' [{rm_count} line(s)]")
+        else:
+            info_print(f"missing '{type_name}'")
+    elif type_name not in ignored_types + created_types and type_name not in existing_types:
+        if type_name in aliases:
+            alias = aliases[type_name]
+            if create or remove:
+                changed_types.add((type_name, alias))
+            else:
+                info_print(f"alias of '{type_name}' is '{alias}'")
+        else:
+            error_print(f"error: alias of '{type_name}' not found.")
+
+# create the new policy according to precedent results
+# - remove rules concerning non existing types
+if remove:
+    for type_name in removed_types:
+        required_types.discard(type_name)
+    new_doc = _rewrite_require_types("\n".join(doc_lines), sorted(required_types), require_indent)
+elif create:
+    new_doc = doc
+# - substitute an alias by its type
+if create or remove:
+    for alias, type_name in changed_types:
+        new_doc = re.compile(rf"\b{re.escape(alias)}\b").sub(type_name, new_doc)
+        debug_print(f"renaming '{alias}' to '{type_name}'")
+        required_types.discard(alias)
+        required_types.add(type_name)
+    # re-sort the require block after renames to restore alphabetical order
+    if changed_types:
+        new_doc = _rewrite_require_types(new_doc, sorted(required_types), require_indent)
+        debug_print("re-sorted require block after renames")
+    with open(policy_path, "w") as file:
+        file.write(new_doc)
+
+info_print(
+    f"----\nsummary: {len(required_types)} required types, {len(removed_types)} removed, {created_counter} created, {len(changed_types)} renamed"
+)

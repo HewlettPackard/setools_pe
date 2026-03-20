@@ -1,0 +1,567 @@
+#!/usr/bin/python3
+
+######
+# SPDX-FileCopyrightText:  © Hewlett Packard Enterprise Development LP
+# SPDX-License-Identifier:  MIT
+######
+
+######
+## Author :
+## Basile Leretaille
+######
+
+######
+# Copyright (c) 2026 Hewlett Packard Enterprise Development LP
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy 
+# of this software and associated documentation files (the “Software”), to deal 
+# in the Software without restriction, including without limitation the rights 
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell 
+# copies of the Software, and to permit persons to whom the Software is 
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in 
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR 
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, 
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE 
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER 
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, 
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE 
+# SOFTWARE.
+######
+
+
+########
+## This tool is meant to merge two or more selinux policies written in the "human readable/explicit" format '.te' that is understood on all OS
+## It can also directly process the output of my 'se_log_analyser' tool.
+## As of now, the script only understand the following types of rules :
+##   - allow
+##   - role
+##   - type_transition
+##   - role_transition
+##   - typeattribute statement
+##   - type definition
+## If a line can't be understood, it will be printed in the error log
+## To add new rules, you have to add the keyword in the 'rules' dict, and create an "extract_from" and an "create_rule" functions on the model of the other ones (and call them as the other ones are called)
+########
+
+
+######
+## Usage example :
+## se_policy_merger --files ./file1 ./file2 -v > rules.te
+######
+
+
+import argparse
+import re
+import sys
+
+# config: default vars
+MODULE_TITLE = "myapp 1.0"
+N = 8  # number of '#' used to embellish categories; those lines will be ignored by the sort function
+show_info = False
+show_debug = False
+
+# global vars
+# - type of rules that the tool can process, the key has to be the first word of the rule line
+rules = {
+    "allow": [],
+    "role": [],
+    "type_transition": [],
+    "type": [],
+    "typeattribute": [],
+    "role_transition": [],
+}
+allow_rules = {}
+role_rules = {}
+type_transition_rules = {}
+type_definition = set()
+typeattribute_rules = {}
+role_transition_rules = {}
+# Regex matches :
+# The following examples are not exhaustive
+# allow myapp_t ld_so_cache_t:file { getattr map open read };
+# OR : allow init_t myapp_t:process transition;
+REGEX_ALLOW_TEMPLATE = re.compile(r"allow (\w+) (\w+):(\w+) (?:{ ?([(\w+) ]+?)(?: ?};)|(\w+)(?: ?;))")
+# role system_r types { myapp_t };
+REGEX_ROLE_TEMPLATE = re.compile(r"role (\w+) types (?:{ ?([(\w+) ]+?)(?: ?};)|(\w+)(?: ?;))")
+# type_transition init_t myapp_exec_t:process myapp_t;
+REGEX_TYPE_TRANSITION_TEMPLATE = re.compile(r"type_transition (\w+) (\w+):(\w+) (\w+) ?;")
+# type myapp_t;
+REGEX_TYPE_DEFINITION_TEMPLATE = re.compile(r"type ([\w, ]+?)(?: *;)")
+# typeattribute myapp_exec_t file_type;
+REGEX_TYPEATTRIBUTE_TEMPLATE = re.compile(r"typeattribute (\S+) ([\w, ]+?)(?: *;)")
+# role_transition unconfined_r myapp_exec_t system_r;
+REGEX_ROLE_TRANSITION_TEMPLATE = re.compile(r"role_transition (\S+) (\S+) (\S+);")
+
+# - required elements
+required_roles = set()
+required_types = set()
+required_attributes = set()
+required_classes = {}
+
+# - counters
+allow_counter = 0
+role_counter = 0
+type_transition_counter = 0
+type_definition_counter = 0
+typeattribute_counter = 0
+role_transition_counter = 0
+
+
+def read_file(file_path):
+    with open(file_path, "r") as file:
+        return file.readlines()
+
+
+def discard_require(lines):
+    """
+    remove one or more require block from the lines
+    this block will be regenerated based on the rules
+    """
+    save_line = True
+    lines_kept = []
+    brace = 0
+    for line in lines:
+        pattern = "require {"
+        if line.startswith(pattern):
+            brace = 1
+            line = line[len(pattern) :]
+            save_line = False
+        remainder = None
+        if brace > 0:
+            for i, c in enumerate(line):
+                if c == "{":
+                    brace += 1
+                elif c == "}":
+                    brace -= 1
+                if brace <= 0:
+                    remainder = line[i + 1 :]
+                    break
+        if save_line:
+            lines_kept.append(line)
+        elif brace <= 0:
+            save_line = True
+            if brace < 0:
+                lines_kept.append("}\n" * (-brace))
+                brace = 0
+            # Save any content that appeared after the closing brace on the same line
+            if remainder and remainder.strip():
+                lines_kept.append(remainder if remainder.endswith("\n") else remainder + "\n")
+    return lines_kept
+
+
+def sort_rules_by_type(lines):
+    """try to categorize each line into the rules dict"""
+    for line in lines:
+        splitted_line = line.split()
+        if splitted_line:
+            line_type = splitted_line[0]
+            if line_type in rules:
+                rules[line_type].append(line)
+            elif line_type == "module":
+                global MODULE_TITLE
+                MODULE_TITLE = line.strip()[7:-1]
+                if show_info:
+                    print(f"module title is now `{MODULE_TITLE}`", file=sys.stderr)
+            elif line_type.startswith("#"):
+                if line_type.startswith("#" * N) or line_type.startswith("#============="):
+                    # Decorative line which are automatically generated by this tool or by selinux/audit2allow are skipped
+                    pass
+                elif show_info:
+                    print(f"commented line ignored > '{line.strip()}'", file=sys.stderr)
+            else:
+                print(
+                    f" -!- warning: unable to categorize line > '{line.strip()}'",
+                    file=sys.stderr,
+                )
+        else:
+            if show_debug:
+                print(f"info: got null line > '{line.strip()}'", file=sys.stderr)
+
+
+# parsing the different rules into python objects
+def err_parsing_line_msg(line):
+    print(f" -!- error parsing line > '{line.strip()}'", file=sys.stderr)
+
+
+def extract_from_allow_rule(line):
+    """parse allow rules"""
+    match = REGEX_ALLOW_TEMPLATE.match(line)
+    if match:
+        subject_type = match.group(1)
+        target_type = match.group(2)
+        required_types.add(subject_type)
+        required_types.add(target_type)
+
+        target_class = match.group(3)
+        if target_class not in required_classes:
+            required_classes[target_class] = set()
+
+        target_perms = set()
+        if match.group(4):
+            for perm in match.group(4).split(" "):
+                if perm != "":
+                    target_perms.add(perm)
+        if match.group(5):
+            target_perms.add(match.group(5))
+        required_classes[target_class].update(target_perms)
+
+        if subject_type not in allow_rules:
+            allow_rules[subject_type] = {}
+        s_dict = allow_rules[subject_type]
+        if target_type not in s_dict:
+            s_dict[target_type] = {}
+        t_dict = s_dict[target_type]
+        if target_class not in t_dict:
+            t_dict[target_class] = set()
+        t_dict[target_class].update(target_perms)
+    else:
+        err_parsing_line_msg(line)
+
+
+def extract_from_role_rule(line):
+    """parse role rules"""
+    match = REGEX_ROLE_TEMPLATE.match(line)
+    if match:
+        role = match.group(1)
+        required_roles.add(role)
+
+        target_types = set()
+        if match.group(2):
+            for type_name in match.group(2).split(" "):
+                if type_name != "":
+                    target_types.add(type_name)
+        if match.group(3):
+            target_types.add(match.group(3))
+        if role not in role_rules:
+            role_rules[role] = set()
+        role_rules[role].update(target_types)
+    else:
+        err_parsing_line_msg(line)
+
+
+def extract_from_type_transition(line):
+    """parse type_transition rules"""
+    match = REGEX_TYPE_TRANSITION_TEMPLATE.match(line)
+    if match:
+        source_type = match.group(1)
+        target_type = match.group(2)
+        required_types.add(source_type)
+        required_types.add(target_type)
+
+        target_class = match.group(3)
+        if target_class not in required_classes:
+            required_classes[target_class] = {"transition"}
+
+        final_type = match.group(4)
+        required_types.add(final_type)
+
+        if source_type not in type_transition_rules:
+            type_transition_rules[source_type] = {}
+        s_dict = type_transition_rules[source_type]
+        if target_type not in s_dict:
+            s_dict[target_type] = {}
+        s_dict[target_type][target_class] = final_type
+    else:
+        err_parsing_line_msg(line)
+
+
+def extract_from_type_definition(line):
+    """parse new type definitions"""
+    match = REGEX_TYPE_DEFINITION_TEMPLATE.match(line)
+    if match:
+        types = match.group(1)
+        if types:
+            for type_name in types.split(","):
+                type_definition.add(type_name.strip())
+    else:
+        err_parsing_line_msg(line)
+
+
+def extract_from_typeattribute_statement(line):
+    """parse typeattribute rules"""
+    match = REGEX_TYPEATTRIBUTE_TEMPLATE.match(line)
+    if match:
+        type_name = match.group(1)
+        required_types.add(type_name)
+        attributes = match.group(2)
+        if type_name not in typeattribute_rules:
+            typeattribute_rules[type_name] = set()
+        attrs = [a.strip() for a in attributes.split(",")]
+        typeattribute_rules[type_name].update(attrs)
+        required_attributes.update(attrs)
+    else:
+        err_parsing_line_msg(line)
+
+
+def extract_from_role_transition(line):
+    """parse role_transition rules"""
+    match = REGEX_ROLE_TRANSITION_TEMPLATE.match(line)
+    if match:
+        source_role = match.group(1)
+        switcher_type = match.group(2)
+        target_role = match.group(3)
+        required_roles.add(source_role)
+        required_types.add(switcher_type)
+        required_roles.add(target_role)
+
+        if source_role not in role_transition_rules:
+            role_transition_rules[source_role] = {}
+        s_dict = role_transition_rules[source_role]
+        if target_role not in s_dict:
+            s_dict[target_role] = set()
+        s_dict[target_role].add(switcher_type)
+    else:
+        err_parsing_line_msg(line)
+
+
+# creation of the require block
+def create_required_classes(tabs=""):
+    str_classes = []
+    for class_ in required_classes:
+        str_classes.append(
+            "class "
+            + class_
+            + " { "
+            + " ".join(sorted(required_classes[class_]))
+            + " };"
+        )
+    return tabs + f"\n{tabs}".join(sorted(str_classes))
+
+
+def create_required_types(tabs=""):
+    if "self" in required_types:
+        required_types.remove("self")
+    return tabs + "type " + ", ".join(sorted(required_types)) + ";\n"
+
+
+def create_required_roles(tabs=""):
+    return tabs + "role " + ", ".join(sorted(required_roles)) + ";\n"
+
+
+def create_required_attributes(tabs=""):
+    return tabs + "attribute " + ", ".join(sorted(required_attributes)) + ";\n"
+
+
+# creation of the rules and statements
+def make_it_shine(lines, pattern, title, tabs=""):
+    """
+        sort and highlight rules by separating them by types (based on pattern) for higher legibility
+    setting pattern as None deactivate the upper separation
+        tabs is the indent inserted in front of lines for a better rendering
+    """
+    lines.sort()
+    txt = (
+        f"\n\n{tabs}"
+        + "#" * (len(title) + 2 + 2 * N)
+        + f"\n{tabs}"
+        + "#" * N
+        + f" {title} "
+        + "#" * N
+        + f"\n{tabs}"
+        + "#" * (len(title) + 2 + 2 * N)
+    )
+    old_subject = None
+    for line in lines:
+        if pattern:
+            match = pattern.match(line)
+            if not match:
+                print(f" -!- error parsing rule > '{line.strip()}'", file=sys.stderr)
+            subject = match.group(1)
+            if old_subject != subject:
+                txt += f"\n\n{tabs}" + "#" * N + f" {subject} " + "#" * N
+                old_subject = subject
+        txt += f"\n{tabs}" + line
+    return txt
+
+
+def create_allow_rules(tabs=""):
+    global allow_counter
+    str_allow_rules = []
+    for subject in allow_rules:
+        for target in allow_rules[subject]:
+            for target_class in allow_rules[subject][target]:
+                str_allow_rules.append(
+                    f"allow {subject} {target}:{target_class}"
+                    + " { "
+                    + " ".join(sorted(allow_rules[subject][target][target_class]))
+                    + " };"
+                )
+                allow_counter += len(allow_rules[subject][target][target_class])
+    return make_it_shine(str_allow_rules, REGEX_ALLOW_TEMPLATE, "ALLOW RULES", tabs)
+
+
+def create_role_rules(tabs=""):
+    global role_counter
+    str_role_rules = []
+    for role in role_rules:
+        str_role_rules.append(
+            f"role {role} types" + " { " + " ".join(sorted(role_rules[role])) + " };"
+        )
+        role_counter += len(role_rules[role])
+    return make_it_shine(str_role_rules, REGEX_ROLE_TEMPLATE, "ROLE RULES", tabs)
+
+
+def create_type_transition_rules(tabs=""):
+    global type_transition_counter
+    str_tt_rules = []
+    for source in type_transition_rules:
+        for target in type_transition_rules[source]:
+            for target_class in type_transition_rules[source][target]:
+                str_tt_rules.append(
+                    f"type_transition {source} {target}:{target_class} {type_transition_rules[source][target][target_class]};"
+                )
+                type_transition_counter += 1
+    if len(str_tt_rules) > 10:
+        pattern = REGEX_TYPE_TRANSITION_TEMPLATE
+    else:
+        pattern = None
+    return make_it_shine(str_tt_rules, pattern, "TYPE TRANSITION RULES", tabs)
+
+
+def create_role_transition_rules(tabs=""):
+    global role_transition_counter
+    str_rt_rules = []
+    for source in role_transition_rules:
+        for target in role_transition_rules[source]:
+            for type_name in role_transition_rules[source][target]:
+                str_rt_rules.append(f"role_transition {source} {type_name} {target};")
+                role_transition_counter += 1
+    if len(str_rt_rules) > 10:
+        pattern = REGEX_ROLE_TRANSITION_TEMPLATE
+    else:
+        pattern = None
+    return make_it_shine(str_rt_rules, pattern, "ROLE TRANSITION RULES", tabs)
+
+
+def create_typeattribute_statement(tabs=""):
+    global typeattribute_counter
+    str_statement = []
+    for type_name in typeattribute_rules:
+        str_statement.append(
+            f"typeattribute {type_name} "
+            + ", ".join(sorted(typeattribute_rules[type_name]))
+            + ";"
+        )
+        typeattribute_counter += len(typeattribute_rules[type_name])
+    if len(str_statement) > 10:
+        pattern = REGEX_TYPEATTRIBUTE_TEMPLATE
+    else:
+        pattern = None
+    return make_it_shine(str_statement, pattern, "TYPE ATTRIBUTES", tabs)
+
+
+def create_type_definition(tabs=""):
+    global type_definition_counter
+    txt = ""
+    for type_name in sorted(type_definition):
+        txt += f"{tabs}type {type_name};\n"
+        type_definition_counter += 1
+    return txt
+
+
+# main function that parse the policies and return the merged one
+def merger(lines):
+    """
+    take the lines of several files and merge them together
+    """
+
+    lines = discard_require(lines)
+
+    sort_rules_by_type(lines)
+
+    actions = {
+        "allow": extract_from_allow_rule,
+        "role": extract_from_role_rule,
+        "type_transition": extract_from_type_transition,
+        "type": extract_from_type_definition,
+        "typeattribute": extract_from_typeattribute_statement,
+        "role_transition": extract_from_role_transition,
+    }
+    for category, func in actions.items():
+        for rule in rules[category]:
+            func(rule)
+
+    output = ""
+
+    def push_to_file(txt):
+        nonlocal output
+        output += txt + "\n"
+
+    push_to_file(f"module {MODULE_TITLE};\n")
+    if len(type_definition) > 0:
+        push_to_file(create_type_definition())
+    if (
+        len(required_types)
+        + len(required_roles)
+        + len(required_classes)
+        + len(required_attributes)
+        > 0
+    ):
+        push_to_file("require {")
+        if len(required_types) > 0:
+            push_to_file(create_required_types("    "))
+        if len(required_roles) > 0:
+            push_to_file(create_required_roles("    "))
+        if len(required_attributes) > 0:
+            push_to_file(create_required_attributes("    "))
+        if len(required_classes) > 0:
+            push_to_file(create_required_classes("    "))
+        push_to_file("}")
+    if len(role_rules) > 0:
+        push_to_file(create_role_rules())
+    if len(type_transition_rules) > 0:
+        push_to_file(create_type_transition_rules())
+    if len(role_transition_rules) > 0:
+        push_to_file(create_role_transition_rules())
+    if len(typeattribute_rules) > 0:
+        push_to_file(create_typeattribute_statement())
+    if len(allow_rules) > 0:
+        push_to_file(create_allow_rules())
+    return output
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Merge several SELinux policy files.")
+    parser.add_argument(
+        "--files",
+        required=True,
+        nargs="+",
+        metavar="FILE",
+        help="Paths to the files to be merged",
+    )
+    parser.add_argument(
+        "--dest",
+        help="Path to the destination file (will be overwritten), if not specified, print in stdout",
+    )
+    parser.add_argument("-v", action="store_true", help="Show info (verbose)")
+    parser.add_argument("-d", action="store_true", help="Show debug")
+    args = parser.parse_args()
+    if args.v:
+        show_info = True
+    if args.d:
+        show_debug = True
+
+    pathd = None
+    lines = []
+
+    for path in args.files:
+        lines.extend(read_file(path))
+    if args.dest:
+        pathd = args.dest
+
+    txt = merger(lines)
+
+    if pathd:
+        with open(pathd, "w") as file:
+            file.write(txt)
+    else:
+        print(txt, file=sys.stdout)
+
+    print(
+        f"the policy now contains:\n- {type_definition_counter} type definition(s)\n- {allow_counter} allow rule(s)\n- {role_counter} role rule(s)\n- {typeattribute_counter} typeattribute rule(s)\n- {type_transition_counter} type transition(s)\n- {role_transition_counter} role transition(s)",
+        file=sys.stderr,
+    )
