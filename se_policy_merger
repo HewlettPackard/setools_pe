@@ -111,6 +111,31 @@ typeattribute_counter = 0
 role_transition_counter = 0
 
 
+def reset_state():
+    """Reset all global mutable state so merger() can be called multiple times."""
+    global MODULE_TITLE, allow_counter, role_counter, type_transition_counter
+    global type_definition_counter, typeattribute_counter, role_transition_counter
+    MODULE_TITLE = "myapp 1.0"
+    for key in rules:
+        rules[key] = []
+    allow_rules.clear()
+    role_rules.clear()
+    type_transition_rules.clear()
+    type_definition.clear()
+    typeattribute_rules.clear()
+    role_transition_rules.clear()
+    required_roles.clear()
+    required_types.clear()
+    required_attributes.clear()
+    required_classes.clear()
+    allow_counter = 0
+    role_counter = 0
+    type_transition_counter = 0
+    type_definition_counter = 0
+    typeattribute_counter = 0
+    role_transition_counter = 0
+
+
 def read_file(file_path):
     with open(file_path, "r") as file:
         return file.readlines()
@@ -160,7 +185,7 @@ def sort_rules_by_type(lines):
         if splitted_line:
             line_type = splitted_line[0]
             if line_type in rules:
-                rules[line_type].append(line)
+                rules[line_type].append(line.strip())
             elif line_type == "module":
                 global MODULE_TITLE
                 MODULE_TITLE = line.strip()[7:-1]
@@ -370,6 +395,7 @@ def make_it_shine(lines, pattern, title, tabs=""):
             match = pattern.match(line)
             if not match:
                 print(f" -!- error parsing rule > '{line.strip()}'", file=sys.stderr)
+                continue
             subject = match.group(1)
             if old_subject != subject:
                 txt += f"\n\n{tabs}" + "#" * N + f" {subject} " + "#" * N
@@ -468,6 +494,7 @@ def merger(lines):
     """
     take the lines of several files and merge them together
     """
+    reset_state()
 
     lines = discard_require(lines)
 
