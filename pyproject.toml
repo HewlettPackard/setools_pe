@@ -1,0 +1,7 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "unit: Unit tests for individual functions (parsing, extraction, generation)",
+    "integration: Integration tests through merger() and multi-file merges",
+    "cli: CLI tests via subprocess invocation",
+]
