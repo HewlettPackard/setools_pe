@@ -39,6 +39,7 @@
 ## aureport
 ## ausearch
 ## audit2allow
+## auditctl -a always,exit -S execve
 ######
 
 ######
