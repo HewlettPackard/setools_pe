@@ -1,0 +1,323 @@
+{
+  "spdxVersion": "SPDX-2.3",
+  "dataLicense": "LicenseRef-HPE-Proprietary",
+  "SPDXID": "SPDXRef-DOCUMENT",
+  "name": "setools_pe-1.0.0-Final",
+  "documentNamespace": "https://hpe.com/sbom/setools_pe/1.0.0/478e6dd0-0941-459d-a3b1-4e90ac27ee8c",
+  "creationInfo": {
+    "created": "2026-03-17T00:00:00Z",
+    "creators": [
+      "Organization: Hewlett Packard Enterprise Development LP",
+      "Person: Basile Leretaille",
+      "Tool: cyclonedx-py-7.2.2"
+    ],
+    "licenseListVersion": "3.22",
+    "comment": "SBOM generated for setools_pe v1.0.0. SHA256 checksumValue on SPDXRef-setools_pe MUST be replaced with the actual SHA256 hash of the release artifact (e.g., setools_pe-1.0.0.tar.gz) before distribution. packageVerificationCode MUST be added to each HPE component when filesAnalyzed is set to true at build time, per HPE-00030-01 requirements. dataLicense is set to LicenseRef-HPE-Proprietary per HPE-00030-01 (HPE does not use CC0-1.0 for this field). This SBOM must be digitally signed per HPE-00030-01 and HPE Code Signing Policy HPE027-02 before upload to VTN."
+  },
+  "packages": [
+    {
+      "SPDXID": "SPDXRef-setools_pe",
+      "name": "setools_pe-1.0.0-Final",
+      "versionInfo": "1.0.0",
+      "supplier": "Organization: Hewlett Packard Enterprise Development LP",
+      "originator": "Person: Basile Leretaille",
+      "downloadLocation": "NOASSERTION",
+      "filesAnalyzed": false,
+      "checksums": [
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "0000000000000000000000000000000000000000000000000000000000000000"
+        }
+      ],
+      "licenseConcluded": "MIT",
+      "licenseDeclared": "MIT",
+      "licenseInfoFromFiles": ["NOASSERTION"],
+      "copyrightText": "Copyright (c) 2026 Hewlett Packard Enterprise Development LP",
+      "packageFileName": "setools_pe-1.0.0.tar.gz",
+      "externalRefs": [
+        {
+          "referenceCategory": "PACKAGE-MANAGER",
+          "referenceType": "purl",
+          "referenceLocator": "pkg:generic/setools_pe@1.0.0"
+        }
+      ],
+      "comment": "Primary product package. The SHA256 checksumValue (currently all zeros) MUST be replaced with the actual SHA256 hash of the release artifact before distribution, per HPE-00030-01 Table 1. Run: sha256sum setools_pe-1.0.0.tar.gz. packageVerificationCode must be added when filesAnalyzed is set to true at build time."
+    },
+    {
+      "SPDXID": "SPDXRef-se_log_analyser",
+      "name": "se_log_analyser",
+      "versionInfo": "1.0.0",
+      "supplier": "Organization: Hewlett Packard Enterprise Development LP",
+      "downloadLocation": "NOASSERTION",
+      "filesAnalyzed": false,
+      "checksums": [
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "9e4f9efc22769c699723bdddb9d532a8084b06905cfcb6bbc6c857841fe17c76"
+        }
+      ],
+      "licenseConcluded": "MIT",
+      "licenseDeclared": "MIT",
+      "licenseInfoFromFiles": ["NOASSERTION"],
+      "copyrightText": "Copyright (c) 2026 Hewlett Packard Enterprise Development LP",
+      "packageFileName": "se_log_analyser-1.0.0.tar.gz",
+      "externalRefs": [
+        {
+          "referenceCategory": "PACKAGE-MANAGER",
+          "referenceType": "purl",
+          "referenceLocator": "pkg:generic/setools_pe/se_log_analyser@1.0.0"
+        }
+      ],
+      "comment": "Analyzes SELinux audit logs and generates policy recommendations enriched with process context, command information, and hierarchical relationships. Supports incremental analysis, file merging, and JSON output. SHA256 checksumValue MUST be replaced with actual hash of release artifact."
+    },
+    {
+      "SPDXID": "SPDXRef-se_policy_merger",
+      "name": "se_policy_merger",
+      "versionInfo": "1.0.0",
+      "supplier": "Organization: Hewlett Packard Enterprise Development LP",
+      "downloadLocation": "NOASSERTION",
+      "filesAnalyzed": false,
+      "checksums": [
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "a198713d96802acc30016bbe7fc238152a0f5e7216cbf9f2e7c9fb0a3216d6c6"
+        }
+      ],
+      "licenseConcluded": "MIT",
+      "licenseDeclared": "MIT",
+      "licenseInfoFromFiles": ["NOASSERTION"],
+      "copyrightText": "Copyright (c) 2026 Hewlett Packard Enterprise Development LP",
+      "packageFileName": "se_policy_merger-1.0.0.tar.gz",
+      "externalRefs": [
+        {
+          "referenceCategory": "PACKAGE-MANAGER",
+          "referenceType": "purl",
+          "referenceLocator": "pkg:generic/setools_pe/se_policy_merger@1.0.0"
+        }
+      ],
+      "comment": "Consolidates multiple SELinux policy .te files into a unified policy, deduplicating rules and generating proper require blocks. Supports allow, role, type_transition, role_transition, typeattribute, and type rules. SHA256 checksumValue MUST be replaced with actual hash of release artifact."
+    },
+    {
+      "SPDXID": "SPDXRef-se_check_type",
+      "name": "se_check_type",
+      "versionInfo": "1.0.0",
+      "supplier": "Organization: Hewlett Packard Enterprise Development LP",
+      "downloadLocation": "NOASSERTION",
+      "filesAnalyzed": false,
+      "checksums": [
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "6c1206ce0b1ff60c231412d26f66b755a754f4150ecbf164b937e4215cc98ebe"
+        }
+      ],
+      "licenseConcluded": "MIT",
+      "licenseDeclared": "MIT",
+      "licenseInfoFromFiles": ["NOASSERTION"],
+      "copyrightText": "Copyright (c) 2026 Hewlett Packard Enterprise Development LP",
+      "packageFileName": "se_check_type-1.0.0.tar.gz",
+      "externalRefs": [
+        {
+          "referenceCategory": "PACKAGE-MANAGER",
+          "referenceType": "purl",
+          "referenceLocator": "pkg:generic/setools_pe/se_check_type@1.0.0"
+        }
+      ],
+      "comment": "Validates that all types referenced in a SELinux policy file exist on the target host. Can automatically create missing types or remove invalid references. SHA256 checksumValue MUST be replaced with actual hash of release artifact."
+    },
+    {
+      "SPDXID": "SPDXRef-psutil",
+      "name": "psutil",
+      "versionInfo": "5.9.8",
+      "supplier": "Organization: Giampaolo Rodola",
+      "downloadLocation": "https://pypi.org/project/psutil/",
+      "filesAnalyzed": false,
+      "licenseConcluded": "BSD-3-Clause",
+      "licenseDeclared": "BSD-3-Clause",
+      "licenseInfoFromFiles": ["NOASSERTION"],
+      "copyrightText": "NOASSERTION",
+      "packageFileName": "psutil-5.9.8.tar.gz",
+      "externalRefs": [
+        {
+          "referenceCategory": "SECURITY",
+          "referenceType": "cpe23Type",
+          "referenceLocator": "cpe:2.3:a:giampaolo_rodola:psutil:5.9.8:*:*:*:*:python:*:*"
+        },
+        {
+          "referenceCategory": "PACKAGE-MANAGER",
+          "referenceType": "purl",
+          "referenceLocator": "pkg:pypi/psutil@5.9.8"
+        }
+      ],
+      "comment": "Cross-platform library for retrieving information on running processes and system utilization. Required by se_log_analyser for process tree inspection. Minimum tested version: 5.9.8 (Rocky Linux 10.1, Ubuntu 24.04.3). Also tested with 7.0.0 (SLES 16.0, Debian 13)."
+    },
+    {
+      "SPDXID": "SPDXRef-python",
+      "name": "Python",
+      "versionInfo": "3.12.3",
+      "supplier": "Organization: Python Software Foundation",
+      "downloadLocation": "https://www.python.org/downloads/",
+      "filesAnalyzed": false,
+      "licenseConcluded": "PSF-2.0",
+      "licenseDeclared": "PSF-2.0",
+      "licenseInfoFromFiles": ["NOASSERTION"],
+      "copyrightText": "Copyright (c) 2001-2026 Python Software Foundation",
+      "packageFileName": "Python-3.12.3.tar.xz",
+      "externalRefs": [
+        {
+          "referenceCategory": "SECURITY",
+          "referenceType": "cpe23Type",
+          "referenceLocator": "cpe:2.3:a:python:python:3.12.3:*:*:*:*:*:*:*"
+        },
+        {
+          "referenceCategory": "PACKAGE-MANAGER",
+          "referenceType": "purl",
+          "referenceLocator": "pkg:generic/python@3.12.3"
+        }
+      ],
+      "comment": "Python interpreter runtime required by all three tools. Minimum Python version required: 3.9 (uses dataclasses, typing). Tested versions: 3.12.3 (Ubuntu 24.04.3), 3.12.12 (Rocky Linux 10.1), 3.13.5 (SLES 16.0, Debian 13)."
+    },
+    {
+      "SPDXID": "SPDXRef-audit2allow",
+      "name": "audit2allow",
+      "versionInfo": ".1",
+      "supplier": "Organization: SELinux Project",
+      "downloadLocation": "https://github.com/SELinuxProject/selinux",
+      "filesAnalyzed": false,
+      "licenseConcluded": "GPL-2.0-or-later",
+      "licenseDeclared": "GPL-2.0-or-later",
+      "licenseInfoFromFiles": ["NOASSERTION"],
+      "copyrightText": "NOASSERTION",
+      "packageFileName": "policycoreutils",
+      "externalRefs": [
+        {
+          "referenceCategory": "SECURITY",
+          "referenceType": "cpe23Type",
+          "referenceLocator": "cpe:2.3:a:selinuxproject:policycoreutils:*:*:*:*:*:*:*:*"
+        },
+        {
+          "referenceCategory": "PACKAGE-MANAGER",
+          "referenceType": "purl",
+          "referenceLocator": "pkg:generic/policycoreutils/audit2allow@.1"
+        }
+      ],
+      "comment": "SELinux policy rule generator from audit denial messages. Part of the policycoreutils package. Version .1 observed consistently across all tested platforms. Required by se_log_analyser. System package: policycoreutils (RHEL/Fedora/Rocky), policycoreutils (Debian/Ubuntu/SLES). Tested on: Rocky Linux 10.1 (v.1), SLES 16.0 (v.1), Debian 13 (v.1), Ubuntu 24.04.3 (v.1)."
+    },
+    {
+      "SPDXID": "SPDXRef-ausearch",
+      "name": "ausearch",
+      "versionInfo": "3.1.2",
+      "supplier": "Organization: Linux Audit Project",
+      "downloadLocation": "https://github.com/linux-audit/audit-userspace",
+      "filesAnalyzed": false,
+      "licenseConcluded": "GPL-2.0-or-later",
+      "licenseDeclared": "GPL-2.0-or-later",
+      "licenseInfoFromFiles": ["NOASSERTION"],
+      "copyrightText": "NOASSERTION",
+      "packageFileName": "audit",
+      "externalRefs": [
+        {
+          "referenceCategory": "SECURITY",
+          "referenceType": "cpe23Type",
+          "referenceLocator": "cpe:2.3:a:linux-audit:audit:3.1.2:*:*:*:*:*:*:*"
+        },
+        {
+          "referenceCategory": "PACKAGE-MANAGER",
+          "referenceType": "purl",
+          "referenceLocator": "pkg:generic/audit/ausearch@3.1.2"
+        }
+      ],
+      "comment": "Queries the Linux audit subsystem logs for specific events. Part of the audit package. Required by se_log_analyser. Minimum tested version: 3.1.2. Tested versions: 3.1.2 (Ubuntu 24.04.3), 4.0 (SLES 16.0), 4.0.2 (Debian 13), 4.0.3 (Rocky Linux 10.1)."
+    },
+    {
+      "SPDXID": "SPDXRef-aureport",
+      "name": "aureport",
+      "versionInfo": "3.1.2",
+      "supplier": "Organization: Linux Audit Project",
+      "downloadLocation": "https://github.com/linux-audit/audit-userspace",
+      "filesAnalyzed": false,
+      "licenseConcluded": "GPL-2.0-or-later",
+      "licenseDeclared": "GPL-2.0-or-later",
+      "licenseInfoFromFiles": ["NOASSERTION"],
+      "copyrightText": "NOASSERTION",
+      "packageFileName": "audit",
+      "externalRefs": [
+        {
+          "referenceCategory": "SECURITY",
+          "referenceType": "cpe23Type",
+          "referenceLocator": "cpe:2.3:a:linux-audit:audit:3.1.2:*:*:*:*:*:*:*"
+        },
+        {
+          "referenceCategory": "PACKAGE-MANAGER",
+          "referenceType": "purl",
+          "referenceLocator": "pkg:generic/audit/aureport@3.1.2"
+        }
+      ],
+      "comment": "Produces summary reports from the Linux audit logs. Part of the audit package (co-versioned with ausearch). Required by se_log_analyser. Minimum tested version: 3.1.2. Tested versions: 3.1.2 (Ubuntu 24.04.3), 4.0 (SLES 16.0), 4.0.2 (Debian 13), 4.0.3 (Rocky Linux 10.1)."
+    }
+  ],
+  "relationships": [
+    {
+      "spdxElementId": "SPDXRef-DOCUMENT",
+      "relationshipType": "DESCRIBES",
+      "relatedSpdxElement": "SPDXRef-setools_pe"
+    },
+    {
+      "spdxElementId": "SPDXRef-setools_pe",
+      "relationshipType": "CONTAINS",
+      "relatedSpdxElement": "SPDXRef-se_log_analyser"
+    },
+    {
+      "spdxElementId": "SPDXRef-setools_pe",
+      "relationshipType": "CONTAINS",
+      "relatedSpdxElement": "SPDXRef-se_policy_merger"
+    },
+    {
+      "spdxElementId": "SPDXRef-setools_pe",
+      "relationshipType": "CONTAINS",
+      "relatedSpdxElement": "SPDXRef-se_check_type"
+    },
+    {
+      "spdxElementId": "SPDXRef-se_log_analyser",
+      "relationshipType": "DYNAMIC_LINK",
+      "relatedSpdxElement": "SPDXRef-python"
+    },
+    {
+      "spdxElementId": "SPDXRef-se_log_analyser",
+      "relationshipType": "DYNAMIC_LINK",
+      "relatedSpdxElement": "SPDXRef-psutil"
+    },
+    {
+      "spdxElementId": "SPDXRef-se_log_analyser",
+      "relationshipType": "DYNAMIC_LINK",
+      "relatedSpdxElement": "SPDXRef-ausearch"
+    },
+    {
+      "spdxElementId": "SPDXRef-se_log_analyser",
+      "relationshipType": "DYNAMIC_LINK",
+      "relatedSpdxElement": "SPDXRef-aureport"
+    },
+    {
+      "spdxElementId": "SPDXRef-se_log_analyser",
+      "relationshipType": "DYNAMIC_LINK",
+      "relatedSpdxElement": "SPDXRef-audit2allow"
+    },
+    {
+      "spdxElementId": "SPDXRef-se_policy_merger",
+      "relationshipType": "DYNAMIC_LINK",
+      "relatedSpdxElement": "SPDXRef-python"
+    },
+    {
+      "spdxElementId": "SPDXRef-se_check_type",
+      "relationshipType": "DYNAMIC_LINK",
+      "relatedSpdxElement": "SPDXRef-python"
+    }
+  ],
+  "hasExtractedLicensingInfos": [
+    {
+      "licenseId": "LicenseRef-HPE-Proprietary",
+      "name": "HPE Proprietary - Internal Use Only",
+      "extractedText": "This SBOM document and its contents are proprietary to Hewlett Packard Enterprise Development LP and are intended for internal HPE use and authorized HPE customers only. This document is not released under CC0-1.0. Redistribution or disclosure outside of authorized channels is subject to HPE confidentiality obligations. Per HPE-00030-01: HPE has decided not to use CC0-1.0 in the dataLicense field.",
+      "comment": "HPE-00030-01 explicitly prohibits using CC0-1.0 for dataLicense to avoid implying the SBOM data is released to the public or not covered by NDA."
+    }
+  ]
+}
