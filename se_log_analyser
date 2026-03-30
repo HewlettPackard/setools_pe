@@ -729,7 +729,7 @@ class Analyzer:
     def __init__(self, key=UNKNOWN, log_path=None, show_explanations=True,
                  look_in_log=True, show_debug=False, show_info=False,
                  state_file_path=None, show_pid_tree=True,
-                 context_filter=None, app_name=None):
+                 context_filter=None, app_name=None, no_index=False):
         # Options
         self.key = key
         self.log_path = log_path or DEFAULT_LOG_PATH
@@ -741,6 +741,7 @@ class Analyzer:
         self.show_pid_tree = show_pid_tree
         self.context_filter = context_filter  # SELinux type to filter on (e.g. "myapp_t")
         self.app_name = app_name              # app name for root PID detection (e.g. "myapp")
+        self.no_index = no_index         # skip all command/namespace indexation
 
         # Counters
         self.avc_counter = 0
@@ -874,10 +875,14 @@ class Analyzer:
 
     def set_index(self, cmd, alias=None):
         """Register a command in the index with an alias. Returns the validated alias."""
+        if self.no_index:
+            return cmd
         return self.cmd_index.register(cmd, alias)
 
     def log_cmd(self, cmd, weight=1):
         """Phase 1 - REGISTER: Log every command encountered during parsing."""
+        if self.no_index:
+            return
         self.cmd_index.log_weight(cmd, weight)
 
     # =====================
@@ -2223,7 +2228,8 @@ class Analyzer:
         # Phase 2 - DECIDE: determine which commands get an alias
         # (PID tree commands are already in all_cmds via log_cmd in parse_execve_logs,
         #  so long ones will be auto-indexed by the len > INDEX_MIN_LEN condition)
-        self.build_index()
+        if not self.no_index:
+            self.build_index()
 
         # JSON dump (after Phase 2: all data collected, index built)
         if json_dest:
@@ -2253,7 +2259,7 @@ class Analyzer:
                 self.save_analyzed_entries()
             return ""
 
-        index_str = self.format_index()
+        index_str = "" if self.no_index else self.format_index()
 
         # Format PID tree AFTER index creation so all aliases (including frequency-based) are available
         pid_tree_str = ""
@@ -2322,6 +2328,7 @@ if __name__ == "__main__":
     parser.add_argument("--ignore-log", action="store_true", help="Ignore the logs (likely for merging purpose)")
     parser.add_argument("--no-explanations", action="store_true", help="Don't show rules explication logs")
     parser.add_argument("--no-tree", action="store_true", help="Don't show PID tree section")
+    parser.add_argument("--no-index", action="store_true", help="Skip all command/namespace indexation (commands shown in full, no INDEX section)")
     parser.add_argument("--debug", action="store_true", help="Show debug info")
     parser.add_argument("--verbose", action="store_true", help="Show verbose info")
     parser.add_argument("--context-filter", help="SELinux type to filter on (e.g. 'myapp_t'). Only AVCs involving this type are kept.")
@@ -2384,6 +2391,7 @@ if __name__ == "__main__":
         show_pid_tree=not args.no_tree,
         context_filter=args.context_filter,
         app_name=args.app_name,
+        no_index=args.no_index,
     )
 
     txt = analyzer.analyze(
