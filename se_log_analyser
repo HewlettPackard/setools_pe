@@ -1577,6 +1577,7 @@ class Analyzer:
         if self.show_debug:
             print(f"[parse_execve_logs] log_path: {self.log_path}", file=sys.stderr)
 
+        reused_pids = set()
         block_num = 0
         try:
             for block in self._iter_subprocess_blocks(cmd):
@@ -1634,6 +1635,15 @@ class Analyzer:
                         key=self.key, live=True,
                     )
                 else:
+                    # Detect PID reuse: ppid changed → remove pk from old parent's children
+                    old_ppid = self.pid_tree[pk].ppid
+                    if old_ppid is not None and ppid != old_ppid:
+                        old_ppid_pk = (old_ppid, self.key)
+                        if old_ppid_pk in self.pid_tree and pk in self.pid_tree[old_ppid_pk].children:
+                            self.pid_tree[old_ppid_pk].children.remove(pk)
+                        reused_pids.add(pid)
+                        # Force-update ppid: merge() won't overwrite a known value
+                        self.pid_tree[pk].ppid = ppid
                     # Update existing entry with more info
                     self.pid_tree[pk].merge(PidTreeEntry(
                         cmd=cmd, ppid=ppid, context=context,
@@ -1664,6 +1674,22 @@ class Analyzer:
 
         if block_num == 0 and (self.show_info or self.show_debug):
             print(f"No EXECVE events found in audit logs (log_path={self.log_path})", file=sys.stderr)
+
+        if reused_pids:
+            sorted_pids = sorted(reused_pids)
+            if self.show_info:
+                full_str = ", ".join(str(p) for p in sorted_pids)
+                print(f"Warning: {len(reused_pids)} PID collision(s) detected (PIDs reused by the kernel): "
+                      f"{full_str}; "
+                      f"PID tree data for the earlier incarnation of these processes is lost.",
+                      file=sys.stderr)
+            else:
+                sample_str = ", ".join(str(p) for p in sorted_pids[:10])
+                suffix = f", ... (+{len(reused_pids) - 10} more)" if len(reused_pids) > 10 else ""
+                print(f"Warning: {len(reused_pids)} PID collision(s) detected (PIDs reused by the kernel), "
+                      f"e.g. {sample_str}{suffix}; "
+                      f"PID tree data for the earlier incarnation of these processes is lost.",
+                      file=sys.stderr)
 
         # Filter pid_tree: keep only processes matching context filter OR that appeared in AVCs
         self.filter_pid_tree()
@@ -1889,6 +1915,27 @@ class Analyzer:
 
         if self.show_info:
             print(f"[enrich_pid_tree] enriched {enriched} processes, labelled {labelled_dead} as dead", file=sys.stderr)
+
+        # Post-enrichment prune: remove dead_process nodes with no children
+        # whose parent is not in the tree (orphaned artifacts from PID reuse)
+        pruned = 0
+        while True:
+            to_remove = []
+            for pk, info in self.pid_tree.items():
+                if info.cmd == DEAD_PROCESS and not info.children:
+                    ppid_pk = (info.ppid, info.key) if info.ppid is not None else None
+                    if ppid_pk is None or ppid_pk not in self.pid_tree:
+                        to_remove.append(pk)
+            if not to_remove:
+                break
+            for pk in to_remove:
+                del self.pid_tree[pk]
+                pruned += 1
+            # Clean stale children references after removal
+            for pk, info in self.pid_tree.items():
+                info.children = [c for c in info.children if c in self.pid_tree]
+        if pruned and self.show_info:
+            print(f"[enrich_pid_tree] pruned {pruned} childless dead_process orphans from PID tree", file=sys.stderr)
 
     def format_pid_tree(self):
         """Format the PID tree as a string for output.

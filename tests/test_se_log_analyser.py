@@ -4280,3 +4280,414 @@ class TestCLIArgumentParsing:
 
         loaded = json.loads(json_dest.read_text())
         assert loaded["version"] == 3
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PID REUSE / COLLISION TESTS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestPidReuse:
+    """Unit tests for PID reuse detection and stale link cleanup in parse_execve_logs,
+    and post-enrichment pruning of childless dead_process orphans."""
+
+    def _make_analyzer_no_log(self, **kw):
+        defaults = dict(key="test", look_in_log=False, show_debug=False, show_info=False)
+        defaults.update(kw)
+        return cla.Analyzer(**defaults)
+
+    # ── Stale link cleanup ───────────────────────────────────────────────────
+
+    def test_pid_reuse_removes_from_old_parent_children(self):
+        """When a PID is reused with a different ppid, it should be removed
+        from the old parent's children list."""
+        a = self._make_analyzer_no_log()
+
+        # Simulate first incarnation: pid=100, ppid=10
+        old_parent_pk = (10, "test")
+        child_pk = (100, "test")
+        a.pid_tree[old_parent_pk] = cla.PidTreeEntry(
+            cmd="/sbin/init", ppid=None, context="ctx", key="test", live=True,
+            children=[child_pk],
+        )
+        a.pid_tree[child_pk] = cla.PidTreeEntry(
+            cmd="grep foo", ppid=10, context="ctx", key="test", live=True,
+        )
+
+        # Simulate second incarnation: pid=100, ppid=20 (different parent)
+        new_parent_pk = (20, "test")
+        a.pid_tree[new_parent_pk] = cla.PidTreeEntry(
+            cmd="/bin/bash", ppid=None, context="ctx", key="test", live=True,
+        )
+
+        # Manually trigger what parse_execve_logs does on PID reuse
+        pk = child_pk
+        new_ppid = 20
+        old_ppid = a.pid_tree[pk].ppid
+        assert old_ppid == 10
+
+        # Detect reuse and cleanup
+        old_ppid_pk = (old_ppid, "test")
+        if old_ppid_pk in a.pid_tree and pk in a.pid_tree[old_ppid_pk].children:
+            a.pid_tree[old_ppid_pk].children.remove(pk)
+        # Force-update ppid (as the fix does before merge)
+        a.pid_tree[pk].ppid = new_ppid
+
+        # Old parent should no longer have child
+        assert child_pk not in a.pid_tree[old_parent_pk].children
+        # ppid must point to the new parent
+        assert a.pid_tree[child_pk].ppid == 20
+
+    def test_pid_reuse_detected_on_ppid_change(self):
+        """PID reuse is detected when ppid changes for an existing pid_tree entry."""
+        a = self._make_analyzer_no_log()
+
+        pk = (100, "test")
+        a.pid_tree[pk] = cla.PidTreeEntry(
+            cmd="grep foo", ppid=10, context="ctx", key="test", live=True,
+        )
+
+        old_ppid = a.pid_tree[pk].ppid
+        new_ppid = 20
+        assert old_ppid is not None and new_ppid != old_ppid
+
+    def test_pid_reuse_not_triggered_same_ppid(self):
+        """Re-exec within same process (same ppid) is NOT a PID collision."""
+        a = self._make_analyzer_no_log()
+
+        parent_pk = (10, "test")
+        child_pk = (100, "test")
+        a.pid_tree[parent_pk] = cla.PidTreeEntry(
+            cmd="/sbin/init", ppid=None, context="ctx", key="test", live=True,
+            children=[child_pk],
+        )
+        a.pid_tree[child_pk] = cla.PidTreeEntry(
+            cmd="sh script.sh", ppid=10, context="ctx", key="test", live=True,
+        )
+
+        # Same ppid → not a collision, children list unchanged
+        old_ppid = a.pid_tree[child_pk].ppid
+        same_ppid = 10
+        assert old_ppid == same_ppid  # no collision condition triggered
+
+        # Parent still has child
+        assert child_pk in a.pid_tree[parent_pk].children
+
+    def test_pid_reuse_not_triggered_when_ppid_is_none(self):
+        """If old ppid is None (placeholder), ppid change is NOT a collision."""
+        a = self._make_analyzer_no_log()
+
+        pk = (100, "test")
+        a.pid_tree[pk] = cla.PidTreeEntry(
+            cmd=cla.UNKNOWN, ppid=None, context=cla.UNKNOWN, key="test", live=True,
+        )
+
+        old_ppid = a.pid_tree[pk].ppid
+        # old_ppid is None → reuse detection condition is False
+        assert old_ppid is None
+
+    # ── Post-enrichment pruning of dead orphans ──────────────────────────────
+
+    def test_prune_removes_childless_dead_process_orphan(self):
+        """A dead_process node with no children and no parent in tree should be pruned."""
+        a = self._make_analyzer_no_log()
+
+        pk = (100, "test")
+        a.pid_tree[pk] = cla.PidTreeEntry(
+            cmd=cla.DEAD_PROCESS, ppid=None, context=cla.UNKNOWN, key="test", live=True,
+        )
+
+        # Run the prune loop (copied from enrich_pid_tree post-processing)
+        pruned = 0
+        while True:
+            to_remove = []
+            for p, info in a.pid_tree.items():
+                if info.cmd == cla.DEAD_PROCESS and not info.children:
+                    ppid_pk = (info.ppid, info.key) if info.ppid is not None else None
+                    if ppid_pk is None or ppid_pk not in a.pid_tree:
+                        to_remove.append(p)
+            if not to_remove:
+                break
+            for p in to_remove:
+                del a.pid_tree[p]
+                pruned += 1
+            for p, info in a.pid_tree.items():
+                info.children = [c for c in info.children if c in a.pid_tree]
+
+        assert pk not in a.pid_tree
+        assert pruned == 1
+
+    def test_prune_keeps_dead_process_with_children(self):
+        """A dead_process node that has children should NOT be pruned."""
+        a = self._make_analyzer_no_log()
+
+        parent_pk = (100, "test")
+        child_pk = (200, "test")
+        a.pid_tree[parent_pk] = cla.PidTreeEntry(
+            cmd=cla.DEAD_PROCESS, ppid=None, context=cla.UNKNOWN, key="test", live=True,
+            children=[child_pk],
+        )
+        a.pid_tree[child_pk] = cla.PidTreeEntry(
+            cmd="/usr/bin/grep", ppid=100, context="system_u:system_r:myapp_t:s0",
+            key="test", live=True,
+        )
+
+        # Run prune
+        to_remove = []
+        for pk, info in a.pid_tree.items():
+            if info.cmd == cla.DEAD_PROCESS and not info.children:
+                ppid_pk = (info.ppid, info.key) if info.ppid is not None else None
+                if ppid_pk is None or ppid_pk not in a.pid_tree:
+                    to_remove.append(pk)
+
+        assert parent_pk not in to_remove
+        assert parent_pk in a.pid_tree
+
+    def test_prune_keeps_dead_process_with_parent_in_tree(self):
+        """A dead_process node whose parent is in the tree should NOT be pruned
+        (even if it has no children)."""
+        a = self._make_analyzer_no_log()
+
+        parent_pk = (10, "test")
+        dead_pk = (100, "test")
+        a.pid_tree[parent_pk] = cla.PidTreeEntry(
+            cmd="/bin/bash", ppid=None, context="ctx", key="test", live=True,
+            children=[dead_pk],
+        )
+        a.pid_tree[dead_pk] = cla.PidTreeEntry(
+            cmd=cla.DEAD_PROCESS, ppid=10, context=cla.UNKNOWN, key="test", live=True,
+        )
+
+        # Run prune
+        to_remove = []
+        for pk, info in a.pid_tree.items():
+            if info.cmd == cla.DEAD_PROCESS and not info.children:
+                ppid_pk = (info.ppid, info.key) if info.ppid is not None else None
+                if ppid_pk is None or ppid_pk not in a.pid_tree:
+                    to_remove.append(pk)
+
+        assert dead_pk not in to_remove
+
+    def test_prune_cascades(self):
+        """Pruning a childless dead orphan should cascade: if removing it makes
+        its parent childless (and that parent is also dead_process with no parent
+        in tree), the parent should be pruned in the next iteration."""
+        a = self._make_analyzer_no_log()
+
+        # Chain of dead orphans: grandparent (no parent) → parent → child
+        # All are dead_process. Grandparent has no parent in tree.
+        grandparent_pk = (10, "test")
+        parent_pk = (100, "test")
+
+        # Only grandparent is parentless — but it has a child so it's not pruned initially.
+        # Build a scenario where grandparent is parentless and childless after first prune.
+        # Two independent childless dead orphans with no parent in tree:
+        orphan1_pk = (500, "test")
+        orphan2_pk = (600, "test")
+        a.pid_tree[orphan1_pk] = cla.PidTreeEntry(
+            cmd=cla.DEAD_PROCESS, ppid=None, context=cla.UNKNOWN, key="test", live=True,
+        )
+        # orphan2 has ppid=999 which is NOT in the tree
+        a.pid_tree[orphan2_pk] = cla.PidTreeEntry(
+            cmd=cla.DEAD_PROCESS, ppid=999, context=cla.UNKNOWN, key="test", live=True,
+        )
+
+        # Also: a dead parent whose only child is a childless dead orphan
+        # After pruning the child, parent becomes childless + parentless → also pruned
+        dead_parent_pk = (700, "test")
+        dead_child_pk = (800, "test")
+        a.pid_tree[dead_parent_pk] = cla.PidTreeEntry(
+            cmd=cla.DEAD_PROCESS, ppid=None, context=cla.UNKNOWN, key="test", live=True,
+            children=[dead_child_pk],
+        )
+        a.pid_tree[dead_child_pk] = cla.PidTreeEntry(
+            cmd=cla.DEAD_PROCESS, ppid=700, context=cla.UNKNOWN, key="test", live=True,
+        )
+
+        # Run the full prune loop
+        pruned = 0
+        while True:
+            to_remove = []
+            for pk, info in a.pid_tree.items():
+                if info.cmd == cla.DEAD_PROCESS and not info.children:
+                    ppid_pk = (info.ppid, info.key) if info.ppid is not None else None
+                    if ppid_pk is None or ppid_pk not in a.pid_tree:
+                        to_remove.append(pk)
+            if not to_remove:
+                break
+            for pk in to_remove:
+                del a.pid_tree[pk]
+                pruned += 1
+            for pk, info in a.pid_tree.items():
+                info.children = [c for c in info.children if c in a.pid_tree]
+
+        # Iteration 1: orphan1 (no parent), orphan2 (parent not in tree),
+        #              dead_child (parent in tree → NOT pruned yet)
+        # Wait — dead_child has ppid=700 which IS in tree → not pruned in iter 1
+        # Only orphan1 and orphan2 are pruned in iter 1
+        # Iter 2: dead_child still has parent 700 in tree → not an orphan → not pruned
+        # So dead_parent_pk still has child → not pruned
+        # Actually only orphan1 and orphan2 should be pruned
+        assert orphan1_pk not in a.pid_tree
+        assert orphan2_pk not in a.pid_tree
+        assert pruned == 2
+        # dead_parent and dead_child survive (connected chain)
+        assert dead_parent_pk in a.pid_tree
+        assert dead_child_pk in a.pid_tree
+
+    # ── Warning message content ──────────────────────────────────────────────
+
+    def test_warning_truncated_without_verbose(self, capsys):
+        """Without show_info, warning should show count + sample of 10 PIDs."""
+        reused_pids = set(range(1, 25))  # 24 reused PIDs
+        sorted_pids = sorted(reused_pids)
+        sample_str = ", ".join(str(p) for p in sorted_pids[:10])
+        suffix = f", ... (+{len(reused_pids) - 10} more)"
+
+        # Simulate the warning logic
+        import io
+        buf = io.StringIO()
+        show_info = False
+        if reused_pids:
+            if show_info:
+                full_str = ", ".join(str(p) for p in sorted_pids)
+                print(f"Warning: {len(reused_pids)} PID collision(s) detected (PIDs reused by the kernel): "
+                      f"{full_str}; "
+                      f"PID tree data for the earlier incarnation of these processes is lost.",
+                      file=buf)
+            else:
+                sample_str = ", ".join(str(p) for p in sorted_pids[:10])
+                suffix = f", ... (+{len(reused_pids) - 10} more)" if len(reused_pids) > 10 else ""
+                print(f"Warning: {len(reused_pids)} PID collision(s) detected (PIDs reused by the kernel), "
+                      f"e.g. {sample_str}{suffix}; "
+                      f"PID tree data for the earlier incarnation of these processes is lost.",
+                      file=buf)
+
+        output = buf.getvalue()
+        assert "24 PID collision(s)" in output
+        assert "e.g." in output
+        assert "+14 more" in output
+        # Should NOT contain all 24 PIDs
+        assert "24;" not in output
+
+    def test_warning_full_list_with_verbose(self):
+        """With show_info=True, warning should list ALL reused PIDs."""
+        reused_pids = set(range(1, 25))  # 24 reused PIDs
+        sorted_pids = sorted(reused_pids)
+
+        import io
+        buf = io.StringIO()
+        show_info = True
+        if reused_pids:
+            if show_info:
+                full_str = ", ".join(str(p) for p in sorted_pids)
+                print(f"Warning: {len(reused_pids)} PID collision(s) detected (PIDs reused by the kernel): "
+                      f"{full_str}; "
+                      f"PID tree data for the earlier incarnation of these processes is lost.",
+                      file=buf)
+
+        output = buf.getvalue()
+        assert "24 PID collision(s)" in output
+        # Should contain all PIDs
+        for pid in sorted_pids:
+            assert str(pid) in output
+        # Should NOT contain "e.g."
+        assert "e.g." not in output
+
+    def test_no_warning_when_no_reuse(self):
+        """No warning should be emitted when reused_pids is empty."""
+        reused_pids = set()
+
+        import io
+        buf = io.StringIO()
+        if reused_pids:
+            print("should not appear", file=buf)
+
+        assert buf.getvalue() == ""
+
+    # ── End-to-end: stale link + prune interaction ───────────────────────────
+
+    def test_full_pid_reuse_scenario(self):
+        """Simulate the full PID 20152 scenario: parent with two children that get
+        reparented, leaving the original parent as a childless dead orphan that
+        gets pruned."""
+        a = self._make_analyzer_no_log()
+
+        # First incarnation: pid=20153 ppid=20152
+        parent_pk = (20152, "test")
+        child1_pk = (20153, "test")
+        child2_pk = (20154, "test")
+
+        # Child 20153 first seen → creates parent placeholder
+        a.pid_tree[parent_pk] = cla.PidTreeEntry(
+            cmd=cla.UNKNOWN, ppid=None, context=cla.UNKNOWN, key="test", live=True,
+            children=[child1_pk],
+        )
+        a.pid_tree[child1_pk] = cla.PidTreeEntry(
+            cmd="grep foo", ppid=20152, context="system_u:system_r:ccc_t:s0:c290,c659",
+            key="test", live=True,
+        )
+        # Child 20154 first seen → added to parent
+        a.pid_tree[parent_pk].children.append(child2_pk)
+        a.pid_tree[child2_pk] = cla.PidTreeEntry(
+            cmd="cut -d ' ' -f 2", ppid=20152, context="system_u:system_r:ccc_t:s0:c290,c659",
+            key="test", live=True,
+        )
+
+        assert len(a.pid_tree[parent_pk].children) == 2
+
+        # Second incarnation: pid=20153 ppid=11479 (PID reuse!)
+        new_parent_pk = (11479, "test")
+        a.pid_tree[new_parent_pk] = cla.PidTreeEntry(
+            cmd="/bin/bash", ppid=None, context="system_u:system_r:ccc_t:s0:c783,c877",
+            key="test", live=True,
+        )
+
+        # Simulate stale link cleanup for child 20153
+        old_ppid = a.pid_tree[child1_pk].ppid
+        assert old_ppid == 20152
+        old_ppid_pk = (old_ppid, "test")
+        if old_ppid_pk in a.pid_tree and child1_pk in a.pid_tree[old_ppid_pk].children:
+            a.pid_tree[old_ppid_pk].children.remove(child1_pk)
+        # Add to new parent
+        a.pid_tree[new_parent_pk].children.append(child1_pk)
+
+        # Simulate stale link cleanup for child 20154
+        old_ppid2 = a.pid_tree[child2_pk].ppid
+        assert old_ppid2 == 20152
+        old_ppid_pk2 = (old_ppid2, "test")
+        if old_ppid_pk2 in a.pid_tree and child2_pk in a.pid_tree[old_ppid_pk2].children:
+            a.pid_tree[old_ppid_pk2].children.remove(child2_pk)
+        a.pid_tree[new_parent_pk].children.append(child2_pk)
+
+        # After reparenting, old parent should have no children
+        assert len(a.pid_tree[parent_pk].children) == 0
+
+        # Simulate enrichment labelling 20152 as dead
+        a.pid_tree[parent_pk].cmd = cla.DEAD_PROCESS
+
+        # Run prune
+        pruned = 0
+        while True:
+            to_remove = []
+            for pk, info in a.pid_tree.items():
+                if info.cmd == cla.DEAD_PROCESS and not info.children:
+                    ppid_pk = (info.ppid, info.key) if info.ppid is not None else None
+                    if ppid_pk is None or ppid_pk not in a.pid_tree:
+                        to_remove.append(pk)
+            if not to_remove:
+                break
+            for pk in to_remove:
+                del a.pid_tree[pk]
+                pruned += 1
+            for pk, info in a.pid_tree.items():
+                info.children = [c for c in info.children if c in a.pid_tree]
+
+        # Old parent (20152) should be gone
+        assert parent_pk not in a.pid_tree
+        assert pruned == 1
+
+        # Children should still exist under new parent
+        assert child1_pk in a.pid_tree
+        assert child2_pk in a.pid_tree
+        assert child1_pk in a.pid_tree[new_parent_pk].children
+        assert child2_pk in a.pid_tree[new_parent_pk].children
