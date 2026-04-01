@@ -1378,6 +1378,7 @@ class TestFormatPidTreeUnit:
             cmd="/bin/bash", ppid=None, context="unconfined_u:unconfined_r:unconfined_t:s0",
             key="test", live=False,
         )
+        a.avc_pids.add(pk)
         output = a.format_pid_tree()
         assert "1234" in output
         assert "/bin/bash" in output
@@ -1396,6 +1397,7 @@ class TestFormatPidTreeUnit:
             cmd="/usr/bin/orphan2", ppid=None, context="system_u:system_r:myapp_t:s0",
             key="test", live=False,
         )
+        a.avc_pids.update([pk1, pk2])
         output = a.format_pid_tree()
         assert "Orphan" in output
         assert "1001" in output
@@ -1426,6 +1428,7 @@ class TestFormatPidTreeUnit:
             cmd="/usr/bin/child2", ppid=2000, context="system_u:system_r:myapp_t:s0",
             key="test", live=False,
         )
+        a.avc_pids.update([child1_pk, child2_pk])
         output = a.format_pid_tree()
         assert "1000" in output
         assert "1001" in output
@@ -1446,6 +1449,7 @@ class TestFormatPidTreeUnit:
                 cmd=f"/usr/bin/level{i}", ppid=ppid, context=f"system_u:system_r:myapp_t:s0",
                 key="test", live=False, children=children,
             )
+        a.avc_pids.add((1005, "test"))  # leaf node has AVC
         output = a.format_pid_tree()
         # Check all levels are present
         for pid in pids:
@@ -1467,6 +1471,7 @@ class TestFormatPidTreeUnit:
             key="test", live=False,
         )
         a.app_root_pids = [root_pk]
+        a.avc_pids.add(child_pk)
         output = a.format_pid_tree()
         assert "[APP ROOT]" in output and "23906" in output
 
@@ -1497,6 +1502,7 @@ class TestFormatPidTreeUnit:
         )
 
         a.app_root_pids = [root1_pk, root2_pk]
+        a.avc_pids.update([child1_pk, child2_pk])
         output = a.format_pid_tree()
         assert "23906" in output and "24534" in output
         # Should indicate multiple roots
@@ -1510,6 +1516,7 @@ class TestFormatPidTreeUnit:
             cmd="/bin/bash", ppid=None, context="system_u:system_r:myapp_t:s0",
             key="myhost", live=False,
         )
+        a.avc_pids.add(pk)
         output = a.format_pid_tree()
         assert "1234@myhost" in output or ("1234" in output and "myhost" in output)
 
@@ -1521,6 +1528,7 @@ class TestFormatPidTreeUnit:
             cmd="/bin/bash", ppid=None, context="system_u:system_r:myapp_t:s0",
             key="test", live=False,
         )
+        a.avc_pids.add(pk)
         output = a.format_pid_tree()
         assert "ctx:" in output
         assert "cmd:" in output
@@ -1534,6 +1542,7 @@ class TestFormatPidTreeUnit:
             cmd="/usr/bin/very-long-command-with-many-arguments", ppid=None,
             context="system_u:system_r:myapp_t:s0", key="test", live=False,
         )
+        a.avc_pids.add(pk)
         output = a.format_pid_tree()
         assert "~CMD1~" in output
 
@@ -3079,6 +3088,7 @@ class TestCmdLoggingAndIndexing:
             cmd=long_cmd, ppid=None, context="system_u:system_r:myapp_t:s0",
             key="test", live=False,
         )
+        a.avc_pids.add(pk)
 
         output = a.format_pid_tree()
         assert "~TREECMD~" in output
@@ -3232,6 +3242,7 @@ class TestNoIndex:
             cmd=long_cmd, ppid=None, context="system_u:system_r:myapp_t:s0",
             key="test", live=False,
         )
+        a.avc_pids.add(pk)
         output = a.format_pid_tree()
         assert long_cmd in output
 
@@ -3479,7 +3490,9 @@ class TestCLI:
         )
         assert result.returncode == 0, f"CLI failed:\n{result.stderr}"
         assert "AVC analyzed from logs" in result.stderr
-        assert "processes in PID tree" in result.stderr
+        assert "PID tree:" in result.stderr
+        assert "found" in result.stderr
+        assert "displayed" in result.stderr
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

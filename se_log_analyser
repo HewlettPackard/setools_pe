@@ -746,6 +746,8 @@ class Analyzer:
         # Counters
         self.avc_counter = 0
         self.file_counter = 0
+        self.pid_tree_found = 0       # total PIDs in tree before AVC-relevance filtering
+        self.pid_tree_displayed = 0   # PIDs actually rendered by format_pid_tree
 
         # Indexing state
         self.cmd_index = CmdIndex(show_debug=show_debug)
@@ -1269,6 +1271,11 @@ class Analyzer:
                             cmd=cmd_match.group(2),
                             pid=cmd_match.group(3),
                         )
+                        if cmd_match.group(3):
+                            try:
+                                self.avc_pids.add((int(cmd_match.group(3)), cmd_match.group(1)))
+                            except ValueError:
+                                pass
                         self.log_cmd(cmd_match.group(2))
                         results.append(
                             AnalysisResult(
@@ -1692,6 +1699,7 @@ class Analyzer:
                       file=sys.stderr)
 
         # Filter pid_tree: keep only processes matching context filter OR that appeared in AVCs
+        self.pid_tree_found += len(self.pid_tree)
         self.filter_pid_tree()
 
         # Try to identify the app root PID
@@ -1972,6 +1980,7 @@ class Analyzer:
             if pk in visited:
                 return
             visited.add(pk)
+            self.pid_tree_displayed += 1
 
             info = self.pid_tree.get(pk)
             if info is None:
@@ -1990,6 +1999,19 @@ class Analyzer:
             for child in sorted(children):
                 format_node(child, indent + 1)
 
+        def collect_subtree(root_pk):
+            """Return the set of all PKs reachable from root_pk without side effects."""
+            result = set()
+            stack = [root_pk]
+            while stack:
+                pk = stack.pop()
+                if pk in result or pk not in self.pid_tree:
+                    continue
+                result.add(pk)
+                for child_pk in self.pid_tree[pk].children:
+                    stack.append(child_pk)
+            return result
+
         # Group entries by key to render separate trees per key
         keys_in_tree = sorted(set(k for _, k in self.pid_tree.keys()))
 
@@ -2006,7 +2028,16 @@ class Analyzer:
                     if info.children:
                         roots.append(pk)
 
-            if roots:
+            # Only render rooted trees where at least one node appeared in an AVC
+            avc_roots = []
+            for root_pk in sorted(roots):
+                subtree_pks = collect_subtree(root_pk)
+                if subtree_pks & self.avc_pids:
+                    avc_roots.append(root_pk)
+                else:
+                    visited.update(subtree_pks)  # mark as visited so they don't appear as orphans
+
+            if avc_roots:
                 key_roots = [pk[0] for pk in self.app_root_pids if pk[1] == tree_key]
                 if key_roots:
                     pids_str = ", ".join(str(p) for p in sorted(key_roots))
@@ -2015,17 +2046,20 @@ class Analyzer:
                 else:
                     output.append(f"# {tree_key} - Process Tree")
                 output.append("#")
-                for root in sorted(roots):
+                for root in avc_roots:
                     format_node(root)
                     output.append("#")
 
             # Also show orphan processes (not connected to any tree) for this key
+            # Only show orphans that appeared in an AVC
             orphans = [pk for pk in self.pid_tree if pk not in visited and pk[1] == tree_key]
-            if orphans:
+            visited.update(orphans)  # mark all as visited regardless of rendering
+            avc_orphans = [pk for pk in orphans if pk in self.avc_pids]
+            if avc_orphans:
                 output.append("#")
                 output.append("# Orphan processes (not connected to main tree):")
-                for pk in sorted(orphans):
-                    visited.add(pk)
+                for pk in sorted(avc_orphans):
+                    self.pid_tree_displayed += 1
                     info = self.pid_tree[pk]
                     pid, entry_key = pk
                     cmd = self.get_index(info.cmd)  # Use alias if indexed
@@ -2462,9 +2496,9 @@ if __name__ == "__main__":
     keys_in_tree = {}
     for (pid, entry_key) in analyzer.pid_tree:
         keys_in_tree[entry_key] = keys_in_tree.get(entry_key, 0) + 1
-    tree_total = len(analyzer.pid_tree)
     key_summary = ", ".join(f"{k}={v}" for k, v in sorted(keys_in_tree.items()))
+    pid_tree_summary = f"PID tree: {analyzer.pid_tree_found} found, {analyzer.pid_tree_displayed} displayed ({key_summary})"
     print(
-        f"{analyzer.avc_counter} AVC analyzed from logs ; {analyzer.file_counter} found in the existing files ; {tree_total} processes in PID tree ({key_summary})",
+        f"{analyzer.avc_counter} AVC analyzed from logs ; {analyzer.file_counter} found in the existing files ; {pid_tree_summary}",
         file=sys.stderr,
     )
