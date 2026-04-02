@@ -225,6 +225,12 @@ REGEX_MAIN_EXPLANATION = re.compile(rf"(\S+) {re.escape(KEY_DELIMITER)} (.*) \(p
 # Module-level Utility Functions
 # =====================
 
+def selinux_type(context):
+    """Extract the type field from a SELinux context string (user:role:type:level)."""
+    parts = context.split(':')
+    return parts[2] if len(parts) >= 3 else context
+
+
 def get_base_cmd(cmd):
     """return the script or bin name of the cmd"""
     if isinstance(cmd, str):
@@ -739,7 +745,7 @@ class Analyzer:
         self.show_info = show_info
         self.state_file_path = state_file_path
         self.show_pid_tree = show_pid_tree
-        self.context_filter = context_filter  # SELinux type to filter on (e.g. "myapp_t")
+        self.context_filter = context_filter  # SELinux types to filter on (e.g. ["myapp_t"])
         self.app_name = app_name              # app name for root PID detection (e.g. "myapp")
         self.no_index = no_index         # skip all command/namespace indexation
 
@@ -851,7 +857,7 @@ class Analyzer:
             try:
                 with open(f"/proc/{pid}/attr/current", "r") as f:
                     context = f.read().strip().rstrip('\x00')
-                if self.context_filter in context:
+                if selinux_type(context) in self.context_filter:
                     ns_ino = os.stat(f"/proc/{pid}/ns/pid").st_ino
                     if ns_ino in exclude_ns:
                         if self.show_debug:
@@ -864,7 +870,7 @@ class Analyzer:
             except (FileNotFoundError, PermissionError, ProcessLookupError, OSError):
                 continue
         if not found and self.show_info:
-            print(f"could not find any process with context '{self.context_filter}', skipping namespace detection...", file=sys.stderr)
+            print(f"could not find any process with context {self.context_filter}, skipping namespace detection...", file=sys.stderr)
         return found
 
     # =====================
@@ -901,7 +907,7 @@ class Analyzer:
         avc_to_remove = []
         for avc in result.avc_list:
             # see philosophical discussion #1768
-            if avc.source_type != self.context_filter and avc.target_type != self.context_filter:
+            if avc.source_type not in self.context_filter and avc.target_type not in self.context_filter:
                 avc_to_remove.append(avc)
         for avc in avc_to_remove:
             result.avc_list.remove(avc)
@@ -1717,7 +1723,7 @@ class Analyzer:
         # Identify relevant PIDs (matching context filter or AVC or non-live)
         relevant_pks = set()
         for pk, info in self.pid_tree.items():
-            if self.context_filter and self.context_filter in info.context:
+            if self.context_filter and selinux_type(info.context) in self.context_filter:
                 relevant_pks.add(pk)
             elif pk in self.avc_pids or not info.live:
                 relevant_pks.add(pk)
@@ -1788,14 +1794,14 @@ class Analyzer:
         for pk, info in self.pid_tree.items():
             if info.cmd == UNKNOWN:
                 continue
-            if get_base_cmd(info.cmd) == app_name_upper and self.context_filter in info.context:
+            if get_base_cmd(info.cmd) == app_name_upper and selinux_type(info.context) in self.context_filter:
                 if pk not in self.app_root_pids:
                     self.app_root_pids.append(pk)
                     if self.show_info:
                         print(f"Identified app root PID: {pk} (cmd={info.cmd})", file=sys.stderr)
 
         if not self.app_root_pids and self.show_info:
-            print(f"Could not identify any app root PID (no process with base command '{self.app_name}' and {self.context_filter} context)", file=sys.stderr)
+            print(f"Could not identify any app root PID (no process with base command '{self.app_name}' and {self.context_filter} contexts)", file=sys.stderr)
 
     def enrich_pid_tree(self):
         """Enrich the PID tree by querying psutil for any process with unknown cmd or context.
@@ -2412,7 +2418,7 @@ if __name__ == "__main__":
     parser.add_argument("--no-index", action="store_true", help="Skip all command/namespace indexation (commands shown in full, no INDEX section)")
     parser.add_argument("--debug", action="store_true", help="Show debug info")
     parser.add_argument("--verbose", action="store_true", help="Show verbose info")
-    parser.add_argument("--context-filter", help="SELinux type to filter on (e.g. 'myapp_t'). Only AVCs involving this type are kept.")
+    parser.add_argument("--context-filter", nargs='+', help="SELinux type(s) to filter on (e.g. 'myapp_t' or 'myapp_t myapp2_t'). Only AVCs involving these types are kept.")
     parser.add_argument("--app-name", help="Application name for root PID detection (e.g. 'myapp'). Used with --context-filter to identify the app root process.")
 
     args = parser.parse_args()
