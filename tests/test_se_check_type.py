@@ -18,25 +18,17 @@ Test structure (bottom-up)
   9. Edge cases             - malformed input, empty blocks, debug output
 """
 
-import importlib
-import importlib.machinery
-import importlib.util
 import os
 import subprocess
-import sys
 import tempfile
 import textwrap
 from unittest import mock
 
 import pytest  # pyright: ignore[reportMissingImports]
 
-# ── import se_check_type as a module ────────────────────────────────────────
-_SCRIPT_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "se_check_type")
-_loader = importlib.machinery.SourceFileLoader("se_check_type", _SCRIPT_PATH)
-_spec = importlib.util.spec_from_loader("se_check_type", _loader, origin=_SCRIPT_PATH)
-sct = importlib.util.module_from_spec(_spec)
-sys.modules["se_check_type"] = sct
-_spec.loader.exec_module(sct)
+from conftest import se_check_type as sct, _PROJECT_ROOT
+
+_SCRIPT_PATH = os.path.join(_PROJECT_ROOT, "se_check_type")
 
 
 # ── fixtures ────────────────────────────────────────────────────────────────
@@ -168,6 +160,7 @@ FAKE_SEINFO_SINGLE_ALIAS = textwrap.dedent("""\
 # REGEX TESTS — verify the compiled patterns work correctly
 # ═══════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.unit
 class TestRegexPatterns:
     """Compiled regex patterns used throughout the module."""
     def test_regex_get_first_type(self):
@@ -250,6 +243,7 @@ class TestRegexPatterns:
 # UNIT TESTS — _extract_names_from_field
 # ═══════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.unit
 class TestExtractNamesFromField:
     """_extract_names_from_field(): parse type names from rule fields."""
     def test_simple_name(self):
@@ -280,6 +274,7 @@ class TestExtractNamesFromField:
 # UNIT TESTS — extract_types_from_rules
 # ═══════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.unit
 class TestExtractTypesFromRules:
     """extract_types_from_rules(): collect all type names from policy rule body."""
     def test_allow_rule(self):
@@ -382,6 +377,7 @@ class TestExtractTypesFromRules:
 # UNIT TESTS — _get_require_block_indices
 # ═══════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.unit
 class TestGetRequireBlockIndices:
     """_get_require_block_indices(): locate require { ... } in policy document."""
     def test_simple_block(self):
@@ -410,6 +406,7 @@ class TestGetRequireBlockIndices:
 # UNIT TESTS — _rewrite_require_types
 # ═══════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.unit
 class TestRewriteRequireTypes:
     """_rewrite_require_types(): consolidate type declarations in require block."""
     def test_consolidates_single_line(self):
@@ -442,6 +439,7 @@ class TestRewriteRequireTypes:
 # UNIT TESTS — parse_args
 # ═══════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.unit
 class TestParseArgs:
     """parse_args(): CLI argument parsing."""
     def test_basic(self):
@@ -476,6 +474,7 @@ class TestParseArgs:
 # UNIT TESTS — parse_seinfo_output
 # ═══════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.unit
 class TestParseSeinfo:
     """parse_seinfo_output(): extract types and aliases from seinfo output."""
     def test_basic_types(self):
@@ -509,6 +508,7 @@ class TestParseSeinfo:
 # UNIT TESTS — parse_policy
 # ═══════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.unit
 class TestParsePolicy:
     """parse_policy(): extract created types, required types, and rule body."""
     def test_simple(self):
@@ -531,6 +531,7 @@ class TestParsePolicy:
 # UNIT TESTS — check_coherency
 # ═══════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.unit
 class TestCheckCoherency:
     """check_coherency(): detect unused/undeclared types in policy."""
     def test_coherent_policy(self):
@@ -598,6 +599,7 @@ class TestCheckCoherency:
 # UNIT TESTS — process_missing_type_remove
 # ═══════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.unit
 class TestProcessMissingTypeRemove:
     """process_missing_type_remove(): remove a missing type from rule lines."""
     def test_removes_standalone_line(self):
@@ -651,6 +653,7 @@ class TestProcessMissingTypeRemove:
 # UNIT TESTS — process_missing_type_create
 # ═══════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.unit
 class TestProcessMissingTypeCreate:
     """process_missing_type_create(): create a new SELinux type module."""
     def test_success(self, tmp_path):
@@ -713,6 +716,7 @@ class TestProcessMissingTypeCreate:
 # INTEGRATION TESTS — main() with mocked seinfo
 # ═══════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.integration
 class TestMainReportMode:
     """main() in default mode (no -r / -c): just reports missing types."""
 
@@ -782,6 +786,7 @@ class TestMainReportMode:
         assert "ignoring the following types" in out
 
 
+@pytest.mark.integration
 class TestMainRemoveMode:
     """main() with -r: removes missing types from the policy."""
 
@@ -847,6 +852,7 @@ class TestMainRemoveMode:
         assert "type container_t, httpd_t, tmp_t, var_log_t;" in new_content
 
 
+@pytest.mark.integration
 class TestMainCreateMode:
     """main() with -c: creates missing types (subprocess mocked)."""
 
@@ -921,6 +927,7 @@ class TestMainCreateMode:
         assert create_run.call_count == 3
 
 
+@pytest.mark.integration
 class TestMainSeInfoFailure:
     """main() when seinfo is unavailable or fails."""
 
@@ -945,6 +952,7 @@ class TestMainSeInfoFailure:
 # INTEGRATION TEST — main() undeclared type raises ValueError
 # ═══════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.integration
 class TestMainUndeclaredRaises:
     """main() raises ValueError when rules use undeclared types."""
     def test_undeclared_type_raises_value_error(self, write_policy, mock_seinfo, capsys):
@@ -963,6 +971,7 @@ class TestMainUndeclaredRaises:
 # INTEGRATION TEST — alias error path (alias not in aliases dict)
 # ═══════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.integration
 class TestMainAliasErrorPath:
     """main() error path when alias target cannot be resolved."""
     def test_alias_not_found_in_dict(self, write_policy, mock_seinfo, capsys):
@@ -1004,6 +1013,7 @@ class TestMainAliasErrorPath:
 # EDGE CASE TESTS
 # ═══════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.integration
 class TestEdgeCases:
     """Edge cases: malformed policies, empty blocks, debug output, etc."""
     def test_policy_no_require_block(self, write_policy, mock_seinfo, capsys):

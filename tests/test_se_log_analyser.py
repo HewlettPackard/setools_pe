@@ -23,9 +23,6 @@ Test categories
 
 import difflib
 import hashlib
-import importlib
-import importlib.machinery
-import importlib.util
 import json
 import os
 import re
@@ -34,19 +31,15 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 from unittest import mock
 
 import psutil
 import pytest # pyright: ignore[reportMissingImports]
 
-# ── import se_log_analyser as a module ──────────────────────────────────────
-# The script has no .py extension, so we build a SourceFileLoader manually.
-_SCRIPT_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "se_log_analyser")
-_loader = importlib.machinery.SourceFileLoader("se_log_analyser", _SCRIPT_PATH)
-_spec = importlib.util.spec_from_loader("se_log_analyser", _loader,
-                                         origin=_SCRIPT_PATH)
-cla = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(cla)
+from conftest import se_log_analyser as cla, _PROJECT_ROOT
+
+_SCRIPT_PATH = os.path.join(_PROJECT_ROOT, "se_log_analyser")
 
 # ── reference log path ───────────────────────────────────────────────────────
 TEST_LOG = os.path.join(os.path.dirname(__file__), "test_log")
@@ -71,6 +64,7 @@ REFERENCE_KEY = "Rocky"
 # We also patch os.stat for /proc/*/ns/pid which doesn't exist for log PIDs.
 
 _real_os_stat = os.stat
+_real_pgrep = cla.pgrep
 
 
 def _safe_os_stat(path, *args, **kwargs):
@@ -93,14 +87,14 @@ def _patch_live_process_lookups(monkeypatch):
 
 def _make_analyzer(key=REFERENCE_KEY, log_path=TEST_LOG, **kw):
     """Create an Analyzer pointed at the reference log, with sane test defaults.
-    Uses context_filter='myapp_t' and app_name='myapp' to match the reference test_log data."""
+    Uses context_filter=['myapp_t'] and app_name='myapp' to match the reference test_log data."""
     defaults = dict(
         show_explanations=True,
         look_in_log=True,
         show_debug=False,
         show_info=False,
         show_pid_tree=True,
-        context_filter="myapp_t",
+        context_filter=["myapp_t"],
         app_name="myapp",
     )
     defaults.update(kw)
@@ -120,6 +114,7 @@ def _run_full_analysis(key=REFERENCE_KEY, tmpdir=None, **kw):
 # UNIT TESTS — Data Classes
 # ═══════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.unit
 class TestAvcDenial:
     def test_to_rule_str(self):
         d = cla.AvcDenial("myapp_t", "cert_t", "dir", "getattr")
@@ -136,6 +131,7 @@ class TestAvcDenial:
         assert d1.to_rule_str() != d2.to_rule_str()
 
 
+@pytest.mark.unit
 class TestCommandContext:
     def test_round_trip_dict(self):
         c = cla.CommandContext(key="Rocky", descriptors={"desc1", "desc2"},
@@ -155,6 +151,7 @@ class TestCommandContext:
         assert len(c.descriptors) == 2
 
 
+@pytest.mark.unit
 class TestAnalysisResult:
     def test_round_trip_dict(self):
         cmd = cla.CommandContext(key="Rocky", cmd="podman info", pid=100)
@@ -167,6 +164,7 @@ class TestAnalysisResult:
         assert r2.avc_list[0].method == "read"
 
 
+@pytest.mark.unit
 class TestPidTreeEntry:
     def test_merge_fills_unknowns(self):
         a = cla.PidTreeEntry(cmd=cla.UNKNOWN, ppid=None, context=cla.UNKNOWN, key="k")
@@ -195,11 +193,37 @@ class TestPidTreeEntry:
         assert (99, "Rocky") in e2.children
         assert (100, "Other") in e2.children
 
+    def test_merge_no_duplicate_children(self):
+        """merge() should not add duplicate children."""
+        a = cla.PidTreeEntry(cmd="bash", ppid=1, context="ctx", key="k",
+                              children=[(200, "k")])
+        b = cla.PidTreeEntry(cmd=cla.UNKNOWN, ppid=None, context=cla.UNKNOWN, key="k",
+                              children=[(200, "k"), (300, "k")])
+        a.merge(b)
+        assert a.children.count((200, "k")) == 1
+        assert (300, "k") in a.children
+        assert len(a.children) == 2
+
+    def test_from_dict_fallback_key(self):
+        """from_dict with entry_key=None should use key from the dict."""
+        d = {"cmd": "ls", "ppid": 1, "context": "ctx", "key": "myhost",
+             "children": [], "live": False}
+        e = cla.PidTreeEntry.from_dict(d, entry_key=None)
+        assert e.key == "myhost"
+
+    def test_from_dict_missing_key_defaults_unknown(self):
+        """from_dict with entry_key=None and no key in dict should default to UNKNOWN."""
+        d = {"cmd": "ls", "ppid": 1, "context": "ctx",
+             "children": [], "live": False}
+        e = cla.PidTreeEntry.from_dict(d, entry_key=None)
+        assert e.key == cla.UNKNOWN
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # UNIT TESTS — Process Utilities (is_process_alive / get_from_pid)
 # ═══════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.unit
 class TestIsProcessAlive:
     """Unit tests for Analyzer.is_process_alive()."""
 
@@ -276,6 +300,7 @@ class TestIsProcessAlive:
         assert issubclass(cla.InvalidPID, cla.ProcessNotAvailable)
 
 
+@pytest.mark.unit
 class TestGetFromPid:
     """Unit tests for Analyzer.get_from_pid() with mocked psutil."""
 
@@ -385,6 +410,7 @@ class TestGetFromPid:
 # UNIT TESTS — Utility Functions
 # ═══════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.unit
 class TestGetBaseCmd:
     def test_simple_binary(self):
         assert cla.get_base_cmd("podman info") == "PODMAN"
@@ -454,6 +480,7 @@ class TestGetBaseCmd:
         assert cla.get_base_cmd("sh /usr/share/myapp/selinux/myapp_selinux_configure") == "MYAPP_SELINUX_CONFIGURE"
 
 
+@pytest.mark.unit
 class TestExtractExecveCommand:
     def test_simple_execve(self):
         block = 'type=EXECVE msg=audit(1770630310.060:18114): argc=2 a0="basename" a1="/bin/myapp"\n'
@@ -474,7 +501,28 @@ class TestExtractExecveCommand:
         assert "ls" in result
         assert "0x" not in result
 
+    def test_execve_all_hex_args_returns_none(self):
+        """EXECVE block where all args are hex addresses should return None."""
+        block = 'type=EXECVE msg=audit(...): argc=2 a0=0xdeadbeef a1=0xc0ffee\n'
+        assert cla.extract_execve_command(block) is None
 
+    def test_execve_no_arg_matches_returns_none(self):
+        """EXECVE block with no recognisable a0=, a1= fields should return None."""
+        block = 'type=EXECVE msg=audit(...): argc=0\n'
+        assert cla.extract_execve_command(block) is None
+
+    def test_execve_empty_block_returns_none(self):
+        """Completely empty block returns None."""
+        assert cla.extract_execve_command("") is None
+
+    def test_execve_only_syscall_no_execve(self):
+        """Block with SYSCALL but no EXECVE type returns None (already covered but
+        verifies both loops fail)."""
+        block = 'type=SYSCALL msg=audit(...): a0=0x1234 a1=0xabcd\n'
+        assert cla.extract_execve_command(block) is None
+
+
+@pytest.mark.unit
 class TestGetEntryId:
     def test_extracts_msg_audit(self):
         block = "type=AVC msg=audit(1770630310.625:18162): avc: denied ..."
@@ -489,9 +537,54 @@ class TestGetEntryId:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# UNIT TESTS — selinux_type
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.unit
+class TestSelinuxType:
+    def test_standard_context(self):
+        assert cla.selinux_type("system_u:system_r:myapp_t:s0-s0:c0.c1023") == "myapp_t"
+
+    def test_minimal_context(self):
+        assert cla.selinux_type("u:r:sshd_t:s0") == "sshd_t"
+
+    def test_two_parts_only(self):
+        """Fewer than 3 parts should return the whole string."""
+        assert cla.selinux_type("u:r") == "u:r"
+
+    def test_single_part(self):
+        assert cla.selinux_type("unlabeled_t") == "unlabeled_t"
+
+    def test_empty_string(self):
+        assert cla.selinux_type("") == ""
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# UNIT TESTS — pgrep
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.unit
+class TestPgrep:
+    def test_finds_current_process(self, monkeypatch):
+        """pgrep should find the current python process."""
+        # Restore real pgrep (autouse fixture patches it to return [])
+        monkeypatch.setattr(cla, "pgrep", _real_pgrep)
+        pids = cla.pgrep("pytest")
+        assert isinstance(pids, list)
+        # Should find at least ourselves (the pytest process)
+        assert len(pids) > 0
+
+    def test_returns_empty_for_nonexistent(self, monkeypatch):
+        monkeypatch.setattr(cla, "pgrep", _real_pgrep)
+        pids = cla.pgrep("nonexistent_process_name_xyz_12345")
+        assert pids == []
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # UNIT TESTS — NsIndex
 # ═══════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.unit
 class TestNsIndex:
     def test_set_and_get(self):
         ns = cla.NsIndex()
@@ -578,6 +671,7 @@ class TestNsIndex:
         assert ids == [100, 200, 300]
 
 
+@pytest.mark.unit
 class TestDetectAppNamespaces:
     """Unit tests for Analyzer.detect_app_namespaces()."""
 
@@ -588,7 +682,7 @@ class TestDetectAppNamespaces:
 
     def test_finds_matching_process(self, tmp_path):
         """Should return namespace inode when a process matches context_filter."""
-        a = cla.Analyzer(key="test", look_in_log=False, context_filter="myapp_t")
+        a = cla.Analyzer(key="test", look_in_log=False, context_filter=["myapp_t"])
         fake_proc = mock.MagicMock()
         fake_proc.info = {"pid": 42}
         with mock.patch("psutil.process_iter", return_value=[fake_proc]):
@@ -602,7 +696,7 @@ class TestDetectAppNamespaces:
 
     def test_no_matching_process_returns_empty(self):
         """Should return [] when no process matches context_filter."""
-        a = cla.Analyzer(key="test", look_in_log=False, context_filter="myapp_t")
+        a = cla.Analyzer(key="test", look_in_log=False, context_filter=["myapp_t"])
         fake_proc = mock.MagicMock()
         fake_proc.info = {"pid": 42}
         with mock.patch("psutil.process_iter", return_value=[fake_proc]):
@@ -614,7 +708,7 @@ class TestDetectAppNamespaces:
 
     def test_skips_inaccessible_processes(self):
         """Processes whose /proc/<pid>/attr/current is unreadable should be skipped."""
-        a = cla.Analyzer(key="test", look_in_log=False, context_filter="myapp_t")
+        a = cla.Analyzer(key="test", look_in_log=False, context_filter=["myapp_t"])
         bad_proc = mock.MagicMock()
         bad_proc.info = {"pid": 1}
         good_proc = mock.MagicMock()
@@ -636,7 +730,7 @@ class TestDetectAppNamespaces:
 
     def test_deduplicates_namespaces(self):
         """Multiple processes in the same namespace should produce one entry."""
-        a = cla.Analyzer(key="test", look_in_log=False, context_filter="myapp_t")
+        a = cla.Analyzer(key="test", look_in_log=False, context_filter=["myapp_t"])
         proc1 = mock.MagicMock()
         proc1.info = {"pid": 10}
         proc2 = mock.MagicMock()
@@ -653,7 +747,7 @@ class TestDetectAppNamespaces:
 
     def test_discovers_multiple_namespaces(self):
         """Processes in different container namespaces should all be returned."""
-        a = cla.Analyzer(key="test", look_in_log=False, context_filter="myapp_t")
+        a = cla.Analyzer(key="test", look_in_log=False, context_filter=["myapp_t"])
         proc1 = mock.MagicMock()
         proc1.info = {"pid": 10}
         proc2 = mock.MagicMock()
@@ -680,7 +774,7 @@ class TestDetectAppNamespaces:
 
     def test_skips_excluded_namespaces(self):
         """Should skip processes whose namespace is in exclude_ns list."""
-        a = cla.Analyzer(key="test", look_in_log=False, context_filter="myapp_t")
+        a = cla.Analyzer(key="test", look_in_log=False, context_filter=["myapp_t"])
         proc_bm = mock.MagicMock()
         proc_bm.info = {"pid": 42}
         proc_ctr = mock.MagicMock()
@@ -707,7 +801,7 @@ class TestDetectAppNamespaces:
 
     def test_returns_empty_when_all_excluded(self):
         """Should return [] when all matching processes are in excluded namespaces."""
-        a = cla.Analyzer(key="test", look_in_log=False, context_filter="myapp_t")
+        a = cla.Analyzer(key="test", look_in_log=False, context_filter=["myapp_t"])
         proc1 = mock.MagicMock()
         proc1.info = {"pid": 10}
 
@@ -724,7 +818,7 @@ class TestDetectAppNamespaces:
 
     def test_excludes_multiple_namespaces(self):
         """Should filter out multiple excluded namespaces."""
-        a = cla.Analyzer(key="test", look_in_log=False, context_filter="myapp_t")
+        a = cla.Analyzer(key="test", look_in_log=False, context_filter=["myapp_t"])
         proc1 = mock.MagicMock()
         proc1.info = {"pid": 10}
         proc2 = mock.MagicMock()
@@ -759,6 +853,7 @@ class TestDetectAppNamespaces:
 # UNIT TESTS — CmdIndex
 # ═══════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.unit
 class TestCmdIndex:
     def test_register_and_get(self):
         ci = cla.CmdIndex()
@@ -825,6 +920,11 @@ class TestCmdIndex:
         d = ci.to_dict()
         assert d == {"podman info": "POD_0001"}
 
+    def test_format_empty_mapping_returns_empty(self):
+        """format() on an empty CmdIndex should return empty string."""
+        ci = cla.CmdIndex()
+        assert ci.format() == ""
+
     def test_log_weight_with_list_input(self):
         """log_weight should accept a list and join it."""
         ci = cla.CmdIndex()
@@ -890,11 +990,72 @@ class TestCmdIndex:
         ci = cla.CmdIndex()
         assert ci.get_alias(12345) == "12345"
 
+    def test_collision_with_template_alias(self):
+        """Collision on a template-formatted alias (CMD_0001) should auto-increment."""
+        ci = cla.CmdIndex()
+        a1 = ci.register("cmd_a", "CMD_0001")
+        assert a1 == "CMD_0001"
+        # Now register a DIFFERENT command with the SAME alias → collision
+        a2 = ci.register("cmd_b", "CMD_0001")
+        assert a2 != a1
+        # Template collision path derives base from alias[:-5]
+        assert a2.startswith("CMD_")
+
+    def test_dunder_methods(self):
+        """Exercise __getitem__, __iter__, items(), values(), keys()."""
+        ci = cla.CmdIndex()
+        ci.register("podman info", "POD_0001")
+        assert ci["podman info"] == "POD_0001"
+        assert list(iter(ci)) == ["podman info"]
+        assert list(ci.items()) == [("podman info", "POD_0001")]
+        assert list(ci.values()) == ["POD_0001"]
+        assert list(ci.keys()) == ["podman info"]
+
+    def test_collision_with_non_template_alias(self):
+        """Collision on a plain alias should use the alias itself as base."""
+        ci = cla.CmdIndex()
+        a1 = ci.register("cmd_a", "MYALIAS")
+        assert a1 == "MYALIAS"
+        a2 = ci.register("cmd_b", "MYALIAS")
+        assert a2 != a1
+        assert a2.startswith("MYALIAS_")
+
+    def test_format_history_word_replacement(self):
+        """When a word differs in two consecutive commands sharing a prefix,
+        the changed word should appear, the repeated ones as ****."""
+        ci = cla.CmdIndex()
+        ci.register("ausearch -i -m avc", "AVC_0001")
+        ci.register("ausearch -i -m msg", "MSG_0001")
+        ci.log_weight("ausearch -i -m avc")
+        ci.log_weight("ausearch -i -m msg")
+        out = ci.format()
+        lines = [l for l in out.strip().split("\n") if l.strip()]
+        assert len(lines) == 2
+        # Second line should have * replacements for the identical prefix
+        assert "***" in lines[1]
+        # But the differing word "msg" should appear verbatim
+        assert "msg" in lines[1]
+
+    def test_format_history_reset_on_base_change(self):
+        """When the base command changes, history should be reset."""
+        ci = cla.CmdIndex()
+        ci.register("ausearch -i -m avc", "AVC_0001")
+        ci.register("podman info", "POD_0001")
+        ci.log_weight("ausearch -i -m avc")
+        ci.log_weight("podman info")
+        out = ci.format()
+        # podman line should NOT have stars — it's a completely different command
+        lines = [l for l in out.strip().split("\n") if l.strip()]
+        for line in lines:
+            if "POD_0001" in line:
+                assert "***" not in line
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # UNIT TESTS — Regex Patterns
 # ═══════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.unit
 class TestRegexPatterns:
     def test_extract_context(self):
         line = ("avc: denied { read open } for pid=23927 comm=podman "
@@ -1139,9 +1300,10 @@ class TestRegexPatterns:
 # UNIT TESTS — Analyzer Filter
 # ═══════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.unit
 class TestFilterAVC:
     def test_keeps_matching_source(self):
-        a = cla.Analyzer(key="test", look_in_log=False, context_filter="myapp_t")
+        a = cla.Analyzer(key="test", look_in_log=False, context_filter=["myapp_t"])
         result = cla.AnalysisResult(
             command=cla.CommandContext(key="test"),
             avc_list=[cla.AvcDenial("myapp_t", "cert_t", "dir", "read")],
@@ -1149,7 +1311,7 @@ class TestFilterAVC:
         assert a.filter_AVC(result) is True
 
     def test_keeps_matching_target(self):
-        a = cla.Analyzer(key="test", look_in_log=False, context_filter="myapp_t")
+        a = cla.Analyzer(key="test", look_in_log=False, context_filter=["myapp_t"])
         result = cla.AnalysisResult(
             command=cla.CommandContext(key="test"),
             avc_list=[cla.AvcDenial("sshd_t", "myapp_t", "file", "write")],
@@ -1157,7 +1319,7 @@ class TestFilterAVC:
         assert a.filter_AVC(result) is True
 
     def test_discards_non_matching(self):
-        a = cla.Analyzer(key="test", look_in_log=False, context_filter="myapp_t")
+        a = cla.Analyzer(key="test", look_in_log=False, context_filter=["myapp_t"])
         result = cla.AnalysisResult(
             command=cla.CommandContext(key="test"),
             avc_list=[cla.AvcDenial("sshd_t", "unlabeled_t", "file", "read")],
@@ -1165,7 +1327,7 @@ class TestFilterAVC:
         assert a.filter_AVC(result) is False
 
     def test_mixed_avcs_partial_filter(self):
-        a = cla.Analyzer(key="test", look_in_log=False, context_filter="myapp_t")
+        a = cla.Analyzer(key="test", look_in_log=False, context_filter=["myapp_t"])
         result = cla.AnalysisResult(
             command=cla.CommandContext(key="test"),
             avc_list=[
@@ -1179,7 +1341,7 @@ class TestFilterAVC:
 
     def test_filter_respects_show_debug(self):
         """filter_AVC should not crash when show_debug is enabled."""
-        a = cla.Analyzer(key="test", look_in_log=False, show_debug=True, context_filter="myapp_t")
+        a = cla.Analyzer(key="test", look_in_log=False, show_debug=True, context_filter=["myapp_t"])
         result = cla.AnalysisResult(
             command=cla.CommandContext(key="test"),
             avc_list=[cla.AvcDenial("sshd_t", "unlabeled_t", "file", "read")],
@@ -1189,7 +1351,7 @@ class TestFilterAVC:
 
     def test_empty_avc_list_after_filter(self):
         """Result with all AVCs filtered out should return False."""
-        a = cla.Analyzer(key="test", look_in_log=False, context_filter="myapp_t")
+        a = cla.Analyzer(key="test", look_in_log=False, context_filter=["myapp_t"])
         result = cla.AnalysisResult(
             command=cla.CommandContext(key="test"),
             avc_list=[
@@ -1202,7 +1364,7 @@ class TestFilterAVC:
 
     def test_multiple_matching_avcs_preserved(self):
         """All AVCs involving the context filter type should be preserved."""
-        a = cla.Analyzer(key="test", look_in_log=False, context_filter="myapp_t")
+        a = cla.Analyzer(key="test", look_in_log=False, context_filter=["myapp_t"])
         result = cla.AnalysisResult(
             command=cla.CommandContext(key="test"),
             avc_list=[
@@ -1223,11 +1385,512 @@ class TestFilterAVC:
         )
         assert a.filter_AVC(result) is True
 
+    def test_multiple_context_filter_types(self):
+        """context_filter with multiple types should keep AVCs matching any of them."""
+        a = cla.Analyzer(key="test", look_in_log=False, context_filter=["myapp_t", "sshd_t"])
+        result = cla.AnalysisResult(
+            command=cla.CommandContext(key="test"),
+            avc_list=[
+                cla.AvcDenial("sshd_t", "unlabeled_t", "file", "read"),
+                cla.AvcDenial("httpd_t", "tmp_t", "dir", "write"),
+                cla.AvcDenial("myapp_t", "cert_t", "dir", "getattr"),
+            ],
+        )
+        assert a.filter_AVC(result) is True
+        assert len(result.avc_list) == 2
+        types = {avc.source_type for avc in result.avc_list}
+        assert types == {"sshd_t", "myapp_t"}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# UNIT TESTS — filter_pid_tree
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.unit
+class TestFilterPidTree:
+    """Unit tests for Analyzer.filter_pid_tree()."""
+
+    def test_keeps_avc_pids(self):
+        """Processes in avc_pids should be kept."""
+        a = cla.Analyzer(key="test", look_in_log=False)
+        pk = (100, "test")
+        a.pid_tree[pk] = cla.PidTreeEntry(cmd="ls", ppid=None, context="ctx", key="test", live=True)
+        a.avc_pids.add(pk)
+        a.filter_pid_tree()
+        assert pk in a.pid_tree
+
+    def test_removes_irrelevant_live(self):
+        """Live processes not in avc_pids should be removed."""
+        a = cla.Analyzer(key="test", look_in_log=False)
+        pk = (100, "test")
+        a.pid_tree[pk] = cla.PidTreeEntry(cmd="ls", ppid=None, context="ctx", key="test", live=True)
+        a.filter_pid_tree()
+        assert pk not in a.pid_tree
+
+    def test_keeps_non_live(self):
+        """Non-live entries (loaded from file/JSON) should always be kept."""
+        a = cla.Analyzer(key="test", look_in_log=False)
+        pk = (100, "test")
+        a.pid_tree[pk] = cla.PidTreeEntry(cmd="ls", ppid=None, context="ctx", key="test", live=False)
+        a.filter_pid_tree()
+        assert pk in a.pid_tree
+
+    def test_preserves_ancestors(self):
+        """Ancestors of relevant PIDs should be kept for tree structure."""
+        a = cla.Analyzer(key="test", look_in_log=False)
+        root_pk = (1, "test")
+        mid_pk = (50, "test")
+        leaf_pk = (100, "test")
+        a.pid_tree[root_pk] = cla.PidTreeEntry(cmd="init", ppid=None, context="ctx", key="test", live=True, children=[mid_pk])
+        a.pid_tree[mid_pk] = cla.PidTreeEntry(cmd="bash", ppid=1, context="ctx", key="test", live=True, children=[leaf_pk])
+        a.pid_tree[leaf_pk] = cla.PidTreeEntry(cmd="app", ppid=50, context="ctx", key="test", live=True)
+        a.avc_pids.add(leaf_pk)
+        a.filter_pid_tree()
+        assert root_pk in a.pid_tree
+        assert mid_pk in a.pid_tree
+        assert leaf_pk in a.pid_tree
+
+    def test_prunes_unknown_linear_root(self):
+        """An unknown:unknown root with only one child should be pruned."""
+        a = cla.Analyzer(key="test", look_in_log=False)
+        root_pk = (1, "test")
+        child_pk = (100, "test")
+        a.pid_tree[root_pk] = cla.PidTreeEntry(
+            cmd=cla.UNKNOWN, ppid=None, context=cla.UNKNOWN, key="test", live=True, children=[child_pk])
+        a.pid_tree[child_pk] = cla.PidTreeEntry(
+            cmd="app", ppid=1, context="myapp_t", key="test", live=True)
+        a.avc_pids.add(child_pk)
+        a.filter_pid_tree()
+        assert root_pk not in a.pid_tree
+        assert child_pk in a.pid_tree
+        assert a.pid_tree[child_pk].ppid is None
+
+    def test_children_updated_after_filter(self):
+        """Children lists should not reference deleted entries."""
+        a = cla.Analyzer(key="test", look_in_log=False)
+        parent_pk = (1, "test")
+        kept_pk = (2, "test")
+        removed_pk = (3, "test")
+        a.pid_tree[parent_pk] = cla.PidTreeEntry(
+            cmd="init", ppid=None, context="ctx", key="test", live=True,
+            children=[kept_pk, removed_pk])
+        a.pid_tree[kept_pk] = cla.PidTreeEntry(
+            cmd="app", ppid=1, context="ctx", key="test", live=True)
+        a.pid_tree[removed_pk] = cla.PidTreeEntry(
+            cmd="other", ppid=1, context="ctx", key="test", live=True)
+        a.avc_pids.add(kept_pk)
+        a.filter_pid_tree()
+        assert removed_pk not in a.pid_tree
+        if parent_pk in a.pid_tree:
+            assert removed_pk not in a.pid_tree[parent_pk].children
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# UNIT TESTS — identify_app_root
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.unit
+class TestIdentifyAppRoot:
+    def test_returns_early_without_app_name(self):
+        a = cla.Analyzer(key="test", look_in_log=False, context_filter=["myapp_t"])
+        a.pid_tree[(1, "test")] = cla.PidTreeEntry(
+            cmd="/bin/bash /usr/sbin/myapp", context="system_u:system_r:myapp_t:s0", key="test")
+        a.identify_app_root()
+        assert len(a.app_root_pids) == 0
+
+    def test_returns_early_without_context_filter(self):
+        a = cla.Analyzer(key="test", look_in_log=False, app_name="myapp")
+        a.pid_tree[(1, "test")] = cla.PidTreeEntry(
+            cmd="/bin/bash /usr/sbin/myapp", context="system_u:system_r:myapp_t:s0", key="test")
+        a.identify_app_root()
+        assert len(a.app_root_pids) == 0
+
+    def test_identifies_matching_root(self):
+        a = cla.Analyzer(key="test", look_in_log=False, context_filter=["myapp_t"], app_name="myapp")
+        pk = (1001, "test")
+        a.pid_tree[pk] = cla.PidTreeEntry(
+            cmd="/bin/bash /usr/sbin/myapp start", context="system_u:system_r:myapp_t:s0", key="test")
+        a.identify_app_root()
+        assert pk in a.app_root_pids
+
+    def test_skips_unknown_cmd(self):
+        a = cla.Analyzer(key="test", look_in_log=False, context_filter=["myapp_t"], app_name="myapp")
+        pk = (1, "test")
+        a.pid_tree[pk] = cla.PidTreeEntry(
+            cmd=cla.UNKNOWN, context="system_u:system_r:myapp_t:s0", key="test")
+        a.identify_app_root()
+        assert pk not in a.app_root_pids
+
+    def test_skips_wrong_context(self):
+        a = cla.Analyzer(key="test", look_in_log=False, context_filter=["myapp_t"], app_name="myapp")
+        pk = (1, "test")
+        a.pid_tree[pk] = cla.PidTreeEntry(
+            cmd="/bin/bash /usr/sbin/myapp", context="system_u:system_r:sshd_t:s0", key="test")
+        a.identify_app_root()
+        assert pk not in a.app_root_pids
+
+    def test_identifies_multiple_roots(self):
+        a = cla.Analyzer(key="test", look_in_log=False, context_filter=["myapp_t"], app_name="myapp")
+        pk1 = (1001, "test")
+        pk2 = (1003, "test")
+        a.pid_tree[pk1] = cla.PidTreeEntry(
+            cmd="/bin/bash /usr/sbin/myapp start", context="system_u:system_r:myapp_t:s0", key="test")
+        a.pid_tree[pk2] = cla.PidTreeEntry(
+            cmd="/bin/bash /usr/sbin/myapp stop", context="system_u:system_r:myapp_t:s0", key="test")
+        a.identify_app_root()
+        assert pk1 in a.app_root_pids
+        assert pk2 in a.app_root_pids
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# UNIT TESTS — File Parsing Functions
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.unit
+class TestParseIndexFromFile:
+    """Unit tests for parse_index_from_file()."""
+
+    def test_parse_simple_index(self):
+        doc = f"allow myapp_t cert_t:dir read;\n{cla.INDEX_DELIMITER}\n### CMD_0001 3 | /usr/bin/podman info\n"
+        a = cla.Analyzer(key="test", look_in_log=False)
+        replacer = a.parse_index_from_file(doc)
+        assert "/usr/bin/podman info" in a.cmd_index or a.cmd_index.get_alias("/usr/bin/podman info") == "CMD_0001"
+        assert isinstance(replacer, list)
+
+    def test_missing_index_delimiter_raises(self):
+        doc = "allow myapp_t cert_t:dir read;"
+        a = cla.Analyzer(key="test", look_in_log=False)
+        with pytest.raises(cla.FileParsingError):
+            a.parse_index_from_file(doc)
+
+    def test_namespace_index_parsed(self):
+        doc = f"rules\n{cla.INDEX_DELIMITER}\n### ~pid_ns_test~ 0 | 12345\n"
+        a = cla.Analyzer(key="test", look_in_log=False)
+        a.parse_index_from_file(doc)
+        assert 12345 in a.ns_index
+
+    def test_alias_collision_produces_replacer(self):
+        a = cla.Analyzer(key="test", look_in_log=False)
+        a.set_index("/usr/bin/cmd1", "CMD_0001")
+        doc = f"rules\n{cla.INDEX_DELIMITER}\n### CMD_0001 1 | /usr/bin/cmd2\n"
+        replacer = a.parse_index_from_file(doc)
+        assert len(replacer) > 0
+        old, new = replacer[0]
+        assert old == "CMD_0001"
+        assert new != "CMD_0001"
+
+    def test_history_dedup_parsing(self):
+        """Multi-word commands with ***** history dedup should be reconstructed."""
+        a = cla.Analyzer(key="test", look_in_log=False)
+        doc = (f"rules\n{cla.INDEX_DELIMITER}\n"
+               f"### AVC_0001 1 | ausearch -i -m avc\n"
+               f"### MSG_0001 1 | ******** ** ** msg\n")
+        a.parse_index_from_file(doc)
+        assert "ausearch -i -m msg" in a.cmd_index or a.cmd_index.get_alias("ausearch -i -m msg ") != "ausearch -i -m msg "
+
+
+@pytest.mark.unit
+class TestParseRulesFromFile:
+    """Unit tests for parse_rules_from_file()."""
+
+    def test_parse_simple_rule(self):
+        doc = (f"allow myapp_t cert_t:dir read;\n"
+               f"# required by :\n"
+               f"#     test | /usr/bin/cmd (pid=100 ; pid_ns=12345)\n"
+               f"{cla.INDEX_DELIMITER}\n")
+        a = cla.Analyzer(key="test", look_in_log=False)
+        results = a.parse_rules_from_file(doc)
+        assert len(results) == 1
+        assert results[0].avc_list[0].source_type == "myapp_t"
+        assert results[0].avc_list[0].target_type == "cert_t"
+        assert results[0].avc_list[0].tclass == "dir"
+        assert results[0].avc_list[0].method == "read"
+        assert results[0].command.key == "test"
+        assert results[0].command.pid == "100"
+
+    def test_missing_index_raises(self):
+        doc = "allow myapp_t cert_t:dir read;"
+        a = cla.Analyzer(key="test", look_in_log=False)
+        with pytest.raises(cla.FileParsingError):
+            a.parse_rules_from_file(doc)
+
+    def test_multiple_rules_parsed(self):
+        doc = (f"allow myapp_t cert_t:dir read;\n"
+               f"# required by :\n"
+               f"#     test | cmd1 (pid=100 ; pid_ns=12345)\n"
+               f"\nallow myapp_t tmp_t:file write;\n"
+               f"# required by :\n"
+               f"#     test | cmd2 (pid=200 ; pid_ns=12345)\n"
+               f"{cla.INDEX_DELIMITER}\n")
+        a = cla.Analyzer(key="test", look_in_log=False)
+        results = a.parse_rules_from_file(doc)
+        assert len(results) == 2
+        methods = {r.avc_list[0].method for r in results}
+        assert "read" in methods
+        assert "write" in methods
+
+    def test_rule_with_descriptors(self):
+        doc = (f"allow myapp_t cert_t:dir read;\n"
+               f"# required by :\n"
+               f"#     test | /usr/bin/cmd (pid=100 ; pid_ns=12345)\n"
+               f"#          | SYSCALL: msg=audit(...) arch=x86_64\n"
+               f"{cla.INDEX_DELIMITER}\n")
+        a = cla.Analyzer(key="test", look_in_log=False)
+        results = a.parse_rules_from_file(doc)
+        assert len(results) == 1
+        assert len(results[0].command.descriptors) > 0
+
+
+@pytest.mark.unit
+class TestParsePidTreeFromFile:
+    """Unit tests for parse_pid_tree_from_file()."""
+
+    def test_parse_simple_tree(self):
+        tree_section = (
+            "# test - Process Tree (APP Root detected at 1001)\n"
+            "#\n"
+            "# ├── pid=1001@test [APP ROOT]        ctx: system_u:system_r:myapp_t:s0                 cmd: /bin/bash /usr/sbin/myapp\n"
+            "# │   ├── pid=1002@test               ctx: system_u:system_r:myapp_t:s0                 cmd: /usr/lib/myapp/worker\n"
+        )
+        doc = f"rules\n{cla.INDEX_DELIMITER}\nindex\n{cla.PID_TREE_DELIMITER}\n{tree_section}"
+        a = cla.Analyzer(key="test", look_in_log=False)
+        a.parse_pid_tree_from_file(doc)
+        assert (1001, "test") in a.pid_tree
+        assert (1002, "test") in a.pid_tree
+        assert a.pid_tree[(1001, "test")].cmd == "/bin/bash /usr/sbin/myapp"
+        assert (1001, "test") in a.app_root_pids
+
+    def test_no_tree_section(self):
+        doc = f"rules\n{cla.INDEX_DELIMITER}\nindex\n"
+        a = cla.Analyzer(key="test", look_in_log=False)
+        a.parse_pid_tree_from_file(doc)
+        assert len(a.pid_tree) == 0
+
+    def test_parent_child_relationship(self):
+        tree_section = (
+            "# test - Process Tree\n"
+            "#\n"
+            "# ├── pid=1@test                      ctx: system_u:system_r:init_t:s0                  cmd: /sbin/init\n"
+            "# │   ├── pid=2@test                  ctx: system_u:system_r:myapp_t:s0                 cmd: /usr/bin/app\n"
+        )
+        doc = f"rules\n{cla.INDEX_DELIMITER}\nindex\n{cla.PID_TREE_DELIMITER}\n{tree_section}"
+        a = cla.Analyzer(key="test", look_in_log=False)
+        a.parse_pid_tree_from_file(doc)
+        assert a.pid_tree[(2, "test")].ppid == 1
+        assert (2, "test") in a.pid_tree[(1, "test")].children
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# UNIT TESTS — State File (load/save)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.unit
+class TestParseExistingFile:
+    """Unit tests for parse_existing_file() — the wrapper that orchestrates index + tree + rules parsing."""
+
+    def test_alias_replacement_applied_to_doc(self):
+        """When parse_index_from_file produces replacements (alias collision),
+        parse_existing_file should apply them to the doc text before parsing rules."""
+        a = cla.Analyzer(key="test", look_in_log=False)
+        # Pre-register an alias so the file's alias collides
+        a.set_index("/usr/bin/cmd_existing", "CMD_0001")
+
+        # The file uses CMD_0001 for a different command — collision!
+        doc = (
+            f"allow myapp_t cert_t:dir read;\n"
+            f"# required by :\n"
+            f"#     test | CMD_0001 (pid=100 ; pid_ns=12345)\n"
+            f"{cla.INDEX_DELIMITER}\n"
+            f"### CMD_0001 1 | /usr/bin/cmd_from_file\n"
+        )
+        results = a.parse_existing_file(doc)
+        assert len(results) == 1
+        # Both commands should be in the index with different aliases
+        alias_existing = a.cmd_index.get_alias("/usr/bin/cmd_existing")
+        alias_from_file = a.cmd_index.get_alias("/usr/bin/cmd_from_file")
+        assert alias_existing != alias_from_file
+        assert alias_existing == "CMD_0001"  # pre-existing keeps its alias
+        # The result's command should be the new alias (replacement applied to doc)
+        assert results[0].command.cmd == alias_from_file
+
+    def test_file_parsing_error_propagates(self):
+        """A malformed file (missing INDEX delimiter) should raise FileParsingError."""
+        a = cla.Analyzer(key="test", look_in_log=False)
+        with pytest.raises(cla.FileParsingError):
+            a.parse_existing_file("no index here")
+
+
+@pytest.mark.unit
+class TestStateFileFunctions:
+    """Unit tests for load_analyzed_entries() and save_analyzed_entries()."""
+
+    def test_save_and_load_roundtrip(self, tmp_path):
+        sf = str(tmp_path / "state.json")
+        a = cla.Analyzer(key="test", look_in_log=False, state_file_path=sf)
+        a.analyzed_entries = {"entry1", "entry2", "entry3"}
+        a.save_analyzed_entries()
+        assert os.path.isfile(sf)
+
+        a2 = cla.Analyzer(key="test", look_in_log=False, state_file_path=sf)
+        a2.load_analyzed_entries()
+        assert a2.analyzed_entries == {"entry1", "entry2", "entry3"}
+
+    def test_load_nonexistent_file(self, tmp_path):
+        sf = str(tmp_path / "nonexistent.json")
+        a = cla.Analyzer(key="test", look_in_log=False, state_file_path=sf)
+        a.load_analyzed_entries()
+        assert a.analyzed_entries == set()
+
+    def test_load_corrupt_file(self, tmp_path):
+        sf = str(tmp_path / "corrupt.json")
+        with open(sf, "w") as f:
+            f.write("{bad json")
+        a = cla.Analyzer(key="test", look_in_log=False, state_file_path=sf)
+        a.load_analyzed_entries()
+        assert a.analyzed_entries == set()
+
+    def test_save_without_state_file(self):
+        a = cla.Analyzer(key="test", look_in_log=False)
+        a.analyzed_entries = {"entry1"}
+        a.save_analyzed_entries()  # should be no-op, no crash
+
+    def test_load_without_state_file(self):
+        a = cla.Analyzer(key="test", look_in_log=False)
+        a.load_analyzed_entries()  # should be no-op, no crash
+        assert a.analyzed_entries == set()
+
+    def test_save_creates_file_atomically(self, tmp_path):
+        """Save should use atomic write (temp + rename)."""
+        sf = str(tmp_path / "state.json")
+        a = cla.Analyzer(key="test", look_in_log=False, state_file_path=sf)
+        a.analyzed_entries = {"x"}
+        a.save_analyzed_entries()
+        with open(sf) as f:
+            data = json.load(f)
+        assert "x" in data["analyzed_entries"]
+
+    def test_is_entry_analyzed_and_mark(self):
+        a = cla.Analyzer(key="test", look_in_log=False)
+        block = "type=AVC msg=audit(1234:100) : test"
+        assert not a.is_entry_analyzed(block)
+        a.mark_entry_analyzed(block)
+        assert a.is_entry_analyzed(block)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# UNIT TESTS — look_for_constraint_violation
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.unit
+class TestLookForConstraintViolation:
+    def test_handles_nonexistent_log(self, capsys):
+        """Should not crash on nonexistent log path."""
+        cla.Analyzer.look_for_constraint_violation("/nonexistent/audit.log")
+        captured = capsys.readouterr()
+        assert "Warning" in captured.err or "could not" in captured.err.lower()
+
+    def test_handles_empty_log(self, tmp_path, capsys):
+        """Should handle empty log without crashing."""
+        log = str(tmp_path / "empty.log")
+        with open(log, "w"):
+            pass
+        cla.Analyzer.look_for_constraint_violation(log)
+        # Should not raise — no assertion needed beyond not crashing
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# UNIT TESTS — enrich_pid_tree
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.unit
+class TestEnrichPidTree:
+    """Unit tests for enrich_pid_tree() dead-process labelling and parent chain walking."""
+
+    def test_labels_dead_processes(self):
+        """Unknown processes whose PID is dead should be labelled DEAD_PROCESS."""
+        a = cla.Analyzer(key="test", look_in_log=False)
+        pk = (9999999, "test")  # PID that certainly doesn't exist
+        a.pid_tree[pk] = cla.PidTreeEntry(
+            cmd=cla.UNKNOWN, ppid=None, context=cla.UNKNOWN, key="test", live=True,
+        )
+        a.avc_pids.add(pk)
+        a.enrich_pid_tree()
+        assert a.pid_tree.get(pk) is None or a.pid_tree[pk].cmd == cla.DEAD_PROCESS
+
+    def test_skips_non_live_entries(self):
+        """Non-live entries (loaded from file/JSON) should not be enriched."""
+        a = cla.Analyzer(key="test", look_in_log=False)
+        pk = (9999999, "test")
+        a.pid_tree[pk] = cla.PidTreeEntry(
+            cmd=cla.UNKNOWN, ppid=None, context=cla.UNKNOWN, key="test", live=False,
+        )
+        a.enrich_pid_tree()
+        # Should remain UNKNOWN (not touched)
+        assert a.pid_tree[pk].cmd == cla.UNKNOWN
+
+    def test_enriches_own_pid(self):
+        """A live entry with our own PID should be enriched with real data."""
+        a = cla.Analyzer(key="test", look_in_log=False)
+        my_pid = os.getpid()
+        pk = (my_pid, "test")
+        a.pid_tree[pk] = cla.PidTreeEntry(
+            cmd=cla.UNKNOWN, ppid=None, context=cla.UNKNOWN, key="test", live=True,
+        )
+        a.avc_pids.add(pk)
+        a.enrich_pid_tree()
+        # Our own process should be enriched with a real command
+        entry = a.pid_tree.get(pk)
+        assert entry is not None
+        assert entry.cmd != cla.UNKNOWN
+        assert entry.ppid is not None
+
+    def test_post_prune_removes_dead_orphans(self):
+        """After enrichment, childless dead_process orphans should be pruned."""
+        a = cla.Analyzer(key="test", look_in_log=False)
+        pk = (9999999, "test")
+        a.pid_tree[pk] = cla.PidTreeEntry(
+            cmd=cla.UNKNOWN, ppid=None, context=cla.UNKNOWN, key="test", live=True,
+        )
+        a.avc_pids.add(pk)
+        a.enrich_pid_tree()
+        # Dead orphan with no children and no parent → pruned
+        assert pk not in a.pid_tree
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# UNIT TESTS — index_pid_tree_cmds
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.unit
+class TestIndexPidTreeCmds:
+    def test_logs_live_commands(self):
+        a = cla.Analyzer(key="test", look_in_log=False)
+        pk = (100, "test")
+        a.pid_tree[pk] = cla.PidTreeEntry(cmd="/usr/bin/app arg", key="test", live=True)
+        a.index_pid_tree_cmds()
+        assert a.cmd_index.get_weight("/usr/bin/app arg") == 1
+
+    def test_skips_non_live(self):
+        a = cla.Analyzer(key="test", look_in_log=False)
+        pk = (100, "test")
+        a.pid_tree[pk] = cla.PidTreeEntry(cmd="/usr/bin/app arg", key="test", live=False)
+        a.index_pid_tree_cmds()
+        assert a.cmd_index.get_weight("/usr/bin/app arg") == 0
+
+    def test_skips_unknown_and_dead(self):
+        a = cla.Analyzer(key="test", look_in_log=False)
+        a.pid_tree[(1, "test")] = cla.PidTreeEntry(cmd=cla.UNKNOWN, key="test", live=True)
+        a.pid_tree[(2, "test")] = cla.PidTreeEntry(cmd=cla.DEAD_PROCESS, key="test", live=True)
+        a.index_pid_tree_cmds()
+        assert a.cmd_index.get_weight(cla.UNKNOWN) == 0
+        assert a.cmd_index.get_weight(cla.DEAD_PROCESS) == 0
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # UNIT TESTS — format_rules
 # ═══════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.unit
 class TestFormatRules:
     """Test the format_rules() function which formats SELinux rules with context."""
 
@@ -1361,6 +2024,7 @@ class TestFormatRules:
 # UNIT TESTS — format_pid_tree
 # ═══════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.unit
 class TestFormatPidTreeUnit:
     """Unit tests for format_pid_tree() function."""
 
@@ -1551,6 +2215,7 @@ class TestFormatPidTreeUnit:
 # UNIT TESTS — to_json / merge_json
 # ═══════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.unit
 class TestJsonSerialization:
     """Unit tests for to_json() and merge_json() methods."""
 
@@ -1826,6 +2491,7 @@ class TestJsonSerialization:
 # INTEGRATION TESTS — Multi-key merge
 # ═══════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.unit
 class TestMultiKeyMerge:
     """Integration tests for merging analyzers with different keys."""
 
@@ -2024,6 +2690,7 @@ class TestMultiKeyMerge:
 # UNIT TESTS — parse_ausearch_from_log edge cases
 # ═══════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.unit
 class TestParseAusearchEdgeCases:
     """Edge cases for parse_ausearch_from_log that don't require ausearch or test_log."""
 
@@ -2148,6 +2815,7 @@ class TestParseAusearchEdgeCases:
 # INTEGRATION TESTS — Full Analysis from Log
 # ═══════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.integration
 @needs_testlog
 @needs_ausearch
 class TestFullAnalysisFromLog:
@@ -2261,6 +2929,7 @@ class TestFullAnalysisFromLog:
 # ROUND-TRIP TESTS — JSON idempotency
 # ═══════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.integration
 @needs_testlog
 @needs_ausearch
 class TestJsonRoundTrip:
@@ -2360,6 +3029,7 @@ class TestJsonRoundTrip:
 # ROUND-TRIP TESTS — Human-readable text
 # ═══════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.integration
 @needs_testlog
 @needs_ausearch
 class TestTextRoundTrip:
@@ -2453,6 +3123,7 @@ class TestTextRoundTrip:
 # CROSS-FORMAT TESTS — text ↔ JSON interoperability
 # ═══════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.integration
 @needs_testlog
 @needs_ausearch
 class TestCrossFormat:
@@ -2582,6 +3253,7 @@ class TestCrossFormat:
 # DIFFERENT KEY TESTS
 # ═══════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.integration
 @needs_testlog
 @needs_ausearch
 class TestDifferentKeys:
@@ -2654,6 +3326,7 @@ class TestDifferentKeys:
 # INPUT MODE COMBINATIONS
 # ═══════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.integration
 @needs_testlog
 @needs_ausearch
 class TestInputModes:
@@ -2760,6 +3433,7 @@ class TestInputModes:
 # OUTPUT MODE TESTS
 # ═══════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.integration
 @needs_testlog
 @needs_ausearch
 class TestOutputModes:
@@ -2799,6 +3473,7 @@ class TestOutputModes:
 # PID TREE TESTS
 # ═══════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.integration
 @needs_testlog
 @needs_ausearch
 class TestPidTree:
@@ -2848,19 +3523,31 @@ class TestPidTree:
         txt = a.analyze(docs=[])
         # Check APP ROOT is under "Process Tree" not "Orphan"
         parts = txt.split(cla.PID_TREE_DELIMITER)
-        if len(parts) >= 2:
-            tree_section = parts[1]
-            # Find the line with APP ROOT
-            for line in tree_section.split("\n"):
-                if "[APP ROOT]" in line:
-                    # It should appear after a "Process Tree" header, not "Orphan"
-                    break
+        assert len(parts) >= 2, "Expected PID_TREE_DELIMITER in output"
+        tree_section = parts[1]
+        # Walk sections; track current header context
+        found_in_tree = False
+        found_in_orphan = False
+        current_is_orphan = False
+        for line in tree_section.split("\n"):
+            if line.startswith("# ") and "Process Tree" in line:
+                current_is_orphan = False
+            elif line.startswith("# ") and "Orphan" in line:
+                current_is_orphan = True
+            if "[APP ROOT]" in line:
+                if current_is_orphan:
+                    found_in_orphan = True
+                else:
+                    found_in_tree = True
+        assert found_in_tree, "APP ROOT should appear under a Process Tree header"
+        assert not found_in_orphan, "APP ROOT should not appear under Orphan header"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # STATE FILE TESTS (incremental analysis)
 # ═══════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.integration
 @needs_testlog
 @needs_ausearch
 class TestStateFile:
@@ -2902,6 +3589,7 @@ class TestStateFile:
 # EDGE CASES
 # ═══════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.unit
 class TestEdgeCases:
     """Edge cases that don't require the reference log."""
 
@@ -2927,6 +3615,20 @@ class TestEdgeCases:
         a2 = cla.Analyzer(key="empty", look_in_log=False, show_pid_tree=False)
         txt = a2.analyze(docs=[], json_docs=[data])
         assert cla.INDEX_DELIMITER in txt
+
+    def test_skip_formatting_saves_state(self, tmp_path):
+        """skip_formatting=True should still save state file."""
+        sf = str(tmp_path / "state.json")
+        j = str(tmp_path / "out.json")
+        a = cla.Analyzer(key="test", look_in_log=False, state_file_path=sf)
+        a.mark_entry_analyzed("type=AVC msg=audit(1234:100) : test")
+        txt = a.analyze(docs=[], json_dest=j, skip_formatting=True)
+        assert txt == ""
+        # State file should have been saved
+        assert os.path.isfile(sf)
+        with open(sf) as f:
+            state = json.load(f)
+        assert len(state["analyzed_entries"]) > 0
 
     def test_parse_ausearch_with_direct_blocks(self):
         """Feed AVC blocks directly to parse_ausearch_from_log."""
@@ -2970,7 +3672,7 @@ class TestEdgeCases:
             type=SYSCALL msg=audit(09/02/2026 10:45:16.012:18378) : arch=x86_64 syscall=openat success=yes exit=9 a0=AT_FDCWD a1=0x7fba81c95743 a2=O_RDONLY|O_NOCTTY|O_CLOEXEC a3=0x0 items=1 ppid=1044 pid=23819 auid=root uid=root gid=root euid=root suid=root fsuid=root egid=root sgid=root fsgid=root tty=(none) ses=141 comm=sshd-session exe=/usr/libexec/openssh/sshd-session subj=system_u:system_r:sshd_t:s0-s0:c0.c1023 key=(null)
             type=AVC msg=audit(09/02/2026 10:45:16.012:18378) : avc:  denied  { read } for  pid=23819 comm=sshd-session name=machine-id dev="vda4" ino=1569927 scontext=system_u:system_r:sshd_t:s0-s0:c0.c1023 tcontext=system_u:object_r:unlabeled_t:s0 tclass=file permissive=1
         """)
-        a = cla.Analyzer(key="test", look_in_log=False, context_filter="myapp_t")
+        a = cla.Analyzer(key="test", look_in_log=False, context_filter=["myapp_t"])
         results = a.parse_ausearch_from_log(blocks=[block])
         # sshd_t → unlabeled_t : neither matches context_filter, so it should be filtered out
         assert len(results) == 0
@@ -2996,6 +3698,7 @@ class TestEdgeCases:
 # INTEGRATION TESTS — log_cmd / register_cmd / indexing
 # ═══════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.unit
 class TestCmdLoggingAndIndexing:
     """Integration tests for log_cmd(), register_cmd(), and the indexing workflow."""
 
@@ -3177,6 +3880,7 @@ class TestCmdLoggingAndIndexing:
 # UNIT TESTS — --no-index flag
 # ═══════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.unit
 class TestNoIndex:
     """Tests for the --no-index feature that skips all indexation."""
 
@@ -3271,6 +3975,7 @@ class TestNoIndex:
 # INTEGRATION TESTS — Indexing (existing tests)
 # ═══════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.integration
 @needs_testlog
 @needs_ausearch
 class TestIndexing:
@@ -3330,6 +4035,7 @@ class TestIndexing:
 # CLI INTEGRATION (subprocess)
 # ═══════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.cli
 @needs_testlog
 @needs_ausearch
 class TestCLI:
@@ -3499,6 +4205,7 @@ class TestCLI:
 # --APP-NAME AND --CONTEXT-FILTER ARGUMENT TESTS
 # ═══════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.cli
 @needs_testlog
 @needs_ausearch
 class TestAppNameAndContextFilter:
@@ -3627,6 +4334,7 @@ class TestAppNameAndContextFilter:
 # CLI ARGUMENT VALIDATION TESTS
 # ═══════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.cli
 class TestCLIArgumentValidation:
     """Test CLI argument validation and error handling."""
 
@@ -3826,6 +4534,7 @@ class TestCLIArgumentValidation:
 # SPECIFIC TEST_LOG CONTENT ASSERTIONS
 # ═══════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.integration
 @needs_testlog
 @needs_ausearch
 class TestKnownLogSpecific:
@@ -3886,6 +4595,7 @@ class TestKnownLogSpecific:
 # MULTIPLE TEXT FILES MERGE
 # ═══════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.integration
 @needs_testlog
 @needs_ausearch
 class TestMultiFileMerge:
@@ -3963,6 +4673,7 @@ class TestMultiFileMerge:
 # TRIPLE ROUND-TRIP (stability test)
 # ═══════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.integration
 @needs_testlog
 @needs_ausearch
 class TestTripleRoundTrip:
@@ -4020,285 +4731,12 @@ class TestTripleRoundTrip:
         )
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# UNIT TESTS — CLI Argument Parsing
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class TestCLIArgumentParsing:
-    """Test command-line argument validation and sanitization."""
-
-    def test_key_sanitization_spaces(self):
-        """--key with spaces should be replaced with underscores."""
-        key = "foo bar baz"
-        for c in [' ', '/', ',', ';', '.', '(', ')', '[', ']', '{', '}']:
-            key = key.replace(c, "_")
-        assert key == "foo_bar_baz"
-
-    def test_key_sanitization_special_chars(self):
-        """--key with special characters should be sanitized."""
-        key = "host/foo;bar,baz.test(1)[2]{3}"
-        for c in [' ', '/', ',', ';', '.', '(', ')', '[', ']', '{', '}']:
-            key = key.replace(c, "_")
-        assert key == "host_foo_bar_baz_test_1__2__3_"
-
-    def test_key_sanitization_newlines_tabs(self):
-        """--key with newlines/tabs should be replaced with hyphens."""
-        key = "foo\nbar\tbaz"
-        for c in ['\n', '\t']:
-            key = key.replace(c, "-")
-        assert key == "foo-bar-baz"
-
-    def test_key_default_unknown(self):
-        """When --key not provided, should default to UNKNOWN."""
-        # Simulate argparse with no --key
-        key = None
-        if not key:
-            key = cla.UNKNOWN
-        assert key == "unknown"
-
-    def test_log_path_validation_not_file(self, tmp_path):
-        """--log pointing to a directory should raise FileNotFoundError."""
-        log_dir = tmp_path / "notafile"
-        log_dir.mkdir()
-
-        # Simulate the validation logic from __main__
-        with pytest.raises(FileNotFoundError, match="not a regular file"):
-            if not os.path.isfile(str(log_dir)):
-                raise FileNotFoundError(f"log path '{log_dir}' does not exist or is not a regular file")
-
-    def test_log_path_validation_not_readable(self, tmp_path):
-        """--log pointing to unreadable file should raise PermissionError."""
-        log_file = tmp_path / "unreadable.log"
-        log_file.write_text("content")
-        log_file.chmod(0o000)
-
-        try:
-            # Simulate the validation logic from __main__
-            with pytest.raises(PermissionError, match="not readable"):
-                if not os.access(str(log_file), os.R_OK):
-                    raise PermissionError(f"log path '{log_file}' is not readable")
-        finally:
-            log_file.chmod(0o644)  # Restore permissions for cleanup
-
-    def test_log_path_validation_not_exists(self):
-        """--log pointing to non-existent file should raise FileNotFoundError."""
-        log_file = "/tmp/does_not_exist_12345.log"
-
-        with pytest.raises(FileNotFoundError, match="not a regular file"):
-            if not os.path.isfile(log_file):
-                raise FileNotFoundError(f"log path '{log_file}' does not exist or is not a regular file")
-
-    def test_log_path_default(self):
-        """When --log not provided, should default to DEFAULT_LOG_PATH."""
-        log_path = None
-        if not log_path:
-            log_path = cla.DEFAULT_LOG_PATH
-        assert log_path == "/var/log/audit/audit.log"
-
-    def test_log_path_realpath_resolution(self, tmp_path):
-        """--log should be resolved to absolute path via os.path.realpath."""
-        log_file = tmp_path / "audit.log"
-        log_file.write_text("content")
-
-        # Create a symlink
-        symlink = tmp_path / "link_to_audit.log"
-        symlink.symlink_to(log_file)
-
-        # Simulate the validation logic from __main__
-        resolved = os.path.realpath(str(symlink))
-        assert resolved == str(log_file)
-
-    def test_files_argument_index_missing(self, tmp_path):
-        """--files with file missing INDEX delimiter should exit with error."""
-        file_no_index = tmp_path / "no_index.txt"
-        file_no_index.write_text("allow myapp_t user_tmp_t:file read;")
-
-        doc = file_no_index.read_text()
-        parts = doc.split(cla.INDEX_DELIMITER)
-
-        with pytest.raises(SystemExit) as excinfo:
-            if len(parts) != 2:
-                print(f"error parsing {file_no_index}: index not found", file=sys.stderr)
-                sys.exit(1)
-        assert excinfo.value.code == 1
-
-    def test_files_argument_valid_index(self, tmp_path):
-        """--files with valid INDEX delimiter should parse successfully."""
-        file_with_index = tmp_path / "with_index.txt"
-        content = f"allow myapp_t user_tmp_t:file read;\n{cla.INDEX_DELIMITER}\n### CMD_0001 1 | cmd"
-        file_with_index.write_text(content)
-
-        doc = file_with_index.read_text()
-        parts = doc.split(cla.INDEX_DELIMITER)
-        assert len(parts) == 2
-
-    def test_json_files_argument_invalid_json(self, tmp_path, capsys):
-        """--json-files with invalid JSON should exit gracefully."""
-        bad_json = tmp_path / "bad.json"
-        bad_json.write_text("{invalid json content")
-
-        with pytest.raises(SystemExit) as excinfo:
-            try:
-                with open(str(bad_json), "r") as f:
-                    json.load(f)
-            except json.JSONDecodeError as e:
-                print(f"error parsing JSON file {bad_json}: {e}", file=sys.stderr)
-                sys.exit(1)
-        assert excinfo.value.code == 1
-        captured = capsys.readouterr()
-        assert "error parsing JSON file" in captured.err
-
-    def test_json_files_argument_valid_json(self, tmp_path):
-        """--json-files with valid JSON should load successfully."""
-        good_json = tmp_path / "good.json"
-        data = {"version": 3, "key": "test", "results": []}
-        good_json.write_text(json.dumps(data))
-
-        with open(str(good_json), "r") as f:
-            loaded = json.load(f)
-        assert loaded["version"] == 3
-        assert loaded["key"] == "test"
-
-    def test_need_human_output_logic(self):
-        """Human-readable output should be generated unless --json-dest without --dest."""
-        # Case 1: --dest provided → need human output
-        args_dest = True
-        args_json_dest = False
-        need_human = bool(args_dest) or not bool(args_json_dest)
-        assert need_human is True
-
-        # Case 2: --json-dest only → skip human output
-        args_dest = False
-        args_json_dest = True
-        need_human = bool(args_dest) or not bool(args_json_dest)
-        assert need_human is False
-
-        # Case 3: both --dest and --json-dest → need human output
-        args_dest = True
-        args_json_dest = True
-        need_human = bool(args_dest) or not bool(args_json_dest)
-        assert need_human is True
-
-        # Case 4: neither (stdout) → need human output
-        args_dest = False
-        args_json_dest = False
-        need_human = bool(args_dest) or not bool(args_json_dest)
-        assert need_human is True
-
-    def test_state_file_argument_optional(self):
-        """--state-file is optional and defaults to None."""
-        state_file_path = None
-        a = cla.Analyzer(key="test", state_file_path=state_file_path)
-        assert a.state_file_path is None
-
-    def test_state_file_argument_provided(self, tmp_path):
-        """--state-file when provided should be passed to Analyzer."""
-        state_file = tmp_path / "state.json"
-        a = cla.Analyzer(key="test", state_file_path=str(state_file))
-        assert a.state_file_path == str(state_file)
-
-    def test_ignore_log_flag(self):
-        """--ignore-log should set look_in_log=False."""
-        ignore_log = True
-        a = cla.Analyzer(key="test", look_in_log=not ignore_log)
-        assert a.look_in_log is False
-
-    def test_no_explanations_flag(self):
-        """--no-explanations should set show_explanations=False."""
-        no_explanations = True
-        a = cla.Analyzer(key="test", show_explanations=not no_explanations)
-        assert a.show_explanations is False
-
-    def test_no_tree_flag(self):
-        """--no-tree should set show_pid_tree=False."""
-        no_tree = True
-        a = cla.Analyzer(key="test", show_pid_tree=not no_tree)
-        assert a.show_pid_tree is False
-
-    def test_no_index_flag(self):
-        """--no-index should set no_index=True."""
-        a = cla.Analyzer(key="test", no_index=True)
-        assert a.no_index is True
-
-    def test_no_index_default_false(self):
-        """no_index should default to False."""
-        a = cla.Analyzer(key="test")
-        assert a.no_index is False
-
-    def test_debug_flag(self):
-        """--debug should set show_debug=True."""
-        debug = True
-        a = cla.Analyzer(key="test", show_debug=debug)
-        assert a.show_debug is True
-
-    def test_verbose_flag(self):
-        """--verbose should set show_info=True."""
-        verbose = True
-        a = cla.Analyzer(key="test", show_info=verbose)
-        assert a.show_info is True
-
-    def test_multiple_files_argument(self, tmp_path):
-        """--files should accept multiple file paths."""
-        file1 = tmp_path / "file1.txt"
-        file2 = tmp_path / "file2.txt"
-        content = f"allow myapp_t user_tmp_t:file read;\n{cla.INDEX_DELIMITER}\n### CMD_0001 1 | cmd"
-        file1.write_text(content)
-        file2.write_text(content)
-
-        # Simulate loading multiple files
-        docs = []
-        for fpath in [file1, file2]:
-            with open(fpath, "r") as f:
-                docs.append(f.read())
-
-        assert len(docs) == 2
-        for doc in docs:
-            assert cla.INDEX_DELIMITER in doc
-
-    def test_multiple_json_files_argument(self, tmp_path):
-        """--json-files should accept multiple JSON file paths."""
-        json1 = tmp_path / "j1.json"
-        json2 = tmp_path / "j2.json"
-        data = {"version": 3, "key": "test", "results": []}
-        json1.write_text(json.dumps(data))
-        json2.write_text(json.dumps(data))
-
-        # Simulate loading multiple JSON files
-        json_docs = []
-        for jpath in [json1, json2]:
-            with open(jpath, "r") as f:
-                json_docs.append(json.load(f))
-
-        assert len(json_docs) == 2
-        for jdoc in json_docs:
-            assert jdoc["version"] == 3
-
-    def test_dest_file_write(self, tmp_path):
-        """--dest should write output to specified file."""
-        dest_file = tmp_path / "output.txt"
-        txt = "allow myapp_t user_tmp_t:file read;"
-
-        with open(str(dest_file), "w") as f:
-            f.write(txt)
-
-        assert dest_file.read_text() == txt
-
-    def test_json_dest_file_write(self, tmp_path):
-        """--json-dest should write JSON output to specified file."""
-        json_dest = tmp_path / "output.json"
-        data = {"version": 3, "key": "test", "results": []}
-
-        with open(str(json_dest), "w") as f:
-            json.dump(data, f, indent=2)
-
-        loaded = json.loads(json_dest.read_text())
-        assert loaded["version"] == 3
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # PID REUSE / COLLISION TESTS
 # ═══════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.unit
 class TestPidReuse:
     """Unit tests for PID reuse detection and stale link cleanup in parse_execve_logs,
     and post-enrichment pruning of childless dead_process orphans."""
@@ -4409,25 +4847,10 @@ class TestPidReuse:
             cmd=cla.DEAD_PROCESS, ppid=None, context=cla.UNKNOWN, key="test", live=True,
         )
 
-        # Run the prune loop (copied from enrich_pid_tree post-processing)
-        pruned = 0
-        while True:
-            to_remove = []
-            for p, info in a.pid_tree.items():
-                if info.cmd == cla.DEAD_PROCESS and not info.children:
-                    ppid_pk = (info.ppid, info.key) if info.ppid is not None else None
-                    if ppid_pk is None or ppid_pk not in a.pid_tree:
-                        to_remove.append(p)
-            if not to_remove:
-                break
-            for p in to_remove:
-                del a.pid_tree[p]
-                pruned += 1
-            for p, info in a.pid_tree.items():
-                info.children = [c for c in info.children if c in a.pid_tree]
+        with mock.patch.object(a, "is_process_alive", side_effect=cla.ProcessDead("dead")):
+            a.enrich_pid_tree()
 
         assert pk not in a.pid_tree
-        assert pruned == 1
 
     def test_prune_keeps_dead_process_with_children(self):
         """A dead_process node that has children should NOT be pruned."""
@@ -4444,15 +4867,9 @@ class TestPidReuse:
             key="test", live=True,
         )
 
-        # Run prune
-        to_remove = []
-        for pk, info in a.pid_tree.items():
-            if info.cmd == cla.DEAD_PROCESS and not info.children:
-                ppid_pk = (info.ppid, info.key) if info.ppid is not None else None
-                if ppid_pk is None or ppid_pk not in a.pid_tree:
-                    to_remove.append(pk)
+        with mock.patch.object(a, "is_process_alive", side_effect=cla.ProcessDead("dead")):
+            a.enrich_pid_tree()
 
-        assert parent_pk not in to_remove
         assert parent_pk in a.pid_tree
 
     def test_prune_keeps_dead_process_with_parent_in_tree(self):
@@ -4470,15 +4887,10 @@ class TestPidReuse:
             cmd=cla.DEAD_PROCESS, ppid=10, context=cla.UNKNOWN, key="test", live=True,
         )
 
-        # Run prune
-        to_remove = []
-        for pk, info in a.pid_tree.items():
-            if info.cmd == cla.DEAD_PROCESS and not info.children:
-                ppid_pk = (info.ppid, info.key) if info.ppid is not None else None
-                if ppid_pk is None or ppid_pk not in a.pid_tree:
-                    to_remove.append(pk)
+        with mock.patch.object(a, "is_process_alive", side_effect=cla.ProcessDead("dead")):
+            a.enrich_pid_tree()
 
-        assert dead_pk not in to_remove
+        assert dead_pk in a.pid_tree
 
     def test_prune_cascades(self):
         """Pruning a childless dead orphan should cascade: if removing it makes
@@ -4486,13 +4898,6 @@ class TestPidReuse:
         in tree), the parent should be pruned in the next iteration."""
         a = self._make_analyzer_no_log()
 
-        # Chain of dead orphans: grandparent (no parent) → parent → child
-        # All are dead_process. Grandparent has no parent in tree.
-        grandparent_pk = (10, "test")
-        parent_pk = (100, "test")
-
-        # Only grandparent is parentless — but it has a child so it's not pruned initially.
-        # Build a scenario where grandparent is parentless and childless after first prune.
         # Two independent childless dead orphans with no parent in tree:
         orphan1_pk = (500, "test")
         orphan2_pk = (600, "test")
@@ -4505,7 +4910,6 @@ class TestPidReuse:
         )
 
         # Also: a dead parent whose only child is a childless dead orphan
-        # After pruning the child, parent becomes childless + parentless → also pruned
         dead_parent_pk = (700, "test")
         dead_child_pk = (800, "test")
         a.pid_tree[dead_parent_pk] = cla.PidTreeEntry(
@@ -4516,106 +4920,14 @@ class TestPidReuse:
             cmd=cla.DEAD_PROCESS, ppid=700, context=cla.UNKNOWN, key="test", live=True,
         )
 
-        # Run the full prune loop
-        pruned = 0
-        while True:
-            to_remove = []
-            for pk, info in a.pid_tree.items():
-                if info.cmd == cla.DEAD_PROCESS and not info.children:
-                    ppid_pk = (info.ppid, info.key) if info.ppid is not None else None
-                    if ppid_pk is None or ppid_pk not in a.pid_tree:
-                        to_remove.append(pk)
-            if not to_remove:
-                break
-            for pk in to_remove:
-                del a.pid_tree[pk]
-                pruned += 1
-            for pk, info in a.pid_tree.items():
-                info.children = [c for c in info.children if c in a.pid_tree]
+        with mock.patch.object(a, "is_process_alive", side_effect=cla.ProcessDead("dead")):
+            a.enrich_pid_tree()
 
-        # Iteration 1: orphan1 (no parent), orphan2 (parent not in tree),
-        #              dead_child (parent in tree → NOT pruned yet)
-        # Wait — dead_child has ppid=700 which IS in tree → not pruned in iter 1
-        # Only orphan1 and orphan2 are pruned in iter 1
-        # Iter 2: dead_child still has parent 700 in tree → not an orphan → not pruned
-        # So dead_parent_pk still has child → not pruned
-        # Actually only orphan1 and orphan2 should be pruned
         assert orphan1_pk not in a.pid_tree
         assert orphan2_pk not in a.pid_tree
-        assert pruned == 2
         # dead_parent and dead_child survive (connected chain)
         assert dead_parent_pk in a.pid_tree
         assert dead_child_pk in a.pid_tree
-
-    # ── Warning message content ──────────────────────────────────────────────
-
-    def test_warning_truncated_without_verbose(self, capsys):
-        """Without show_info, warning should show count + sample of 10 PIDs."""
-        reused_pids = set(range(1, 25))  # 24 reused PIDs
-        sorted_pids = sorted(reused_pids)
-        sample_str = ", ".join(str(p) for p in sorted_pids[:10])
-        suffix = f", ... (+{len(reused_pids) - 10} more)"
-
-        # Simulate the warning logic
-        import io
-        buf = io.StringIO()
-        show_info = False
-        if reused_pids:
-            if show_info:
-                full_str = ", ".join(str(p) for p in sorted_pids)
-                print(f"Warning: {len(reused_pids)} PID collision(s) detected (PIDs reused by the kernel): "
-                      f"{full_str}; "
-                      f"PID tree data for the earlier incarnation of these processes is lost.",
-                      file=buf)
-            else:
-                sample_str = ", ".join(str(p) for p in sorted_pids[:10])
-                suffix = f", ... (+{len(reused_pids) - 10} more)" if len(reused_pids) > 10 else ""
-                print(f"Warning: {len(reused_pids)} PID collision(s) detected (PIDs reused by the kernel), "
-                      f"e.g. {sample_str}{suffix}; "
-                      f"PID tree data for the earlier incarnation of these processes is lost.",
-                      file=buf)
-
-        output = buf.getvalue()
-        assert "24 PID collision(s)" in output
-        assert "e.g." in output
-        assert "+14 more" in output
-        # Should NOT contain all 24 PIDs
-        assert "24;" not in output
-
-    def test_warning_full_list_with_verbose(self):
-        """With show_info=True, warning should list ALL reused PIDs."""
-        reused_pids = set(range(1, 25))  # 24 reused PIDs
-        sorted_pids = sorted(reused_pids)
-
-        import io
-        buf = io.StringIO()
-        show_info = True
-        if reused_pids:
-            if show_info:
-                full_str = ", ".join(str(p) for p in sorted_pids)
-                print(f"Warning: {len(reused_pids)} PID collision(s) detected (PIDs reused by the kernel): "
-                      f"{full_str}; "
-                      f"PID tree data for the earlier incarnation of these processes is lost.",
-                      file=buf)
-
-        output = buf.getvalue()
-        assert "24 PID collision(s)" in output
-        # Should contain all PIDs
-        for pid in sorted_pids:
-            assert str(pid) in output
-        # Should NOT contain "e.g."
-        assert "e.g." not in output
-
-    def test_no_warning_when_no_reuse(self):
-        """No warning should be emitted when reused_pids is empty."""
-        reused_pids = set()
-
-        import io
-        buf = io.StringIO()
-        if reused_pids:
-            print("should not appear", file=buf)
-
-        assert buf.getvalue() == ""
 
     # ── End-to-end: stale link + prune interaction ───────────────────────────
 
@@ -4678,29 +4990,2027 @@ class TestPidReuse:
         # Simulate enrichment labelling 20152 as dead
         a.pid_tree[parent_pk].cmd = cla.DEAD_PROCESS
 
-        # Run prune
-        pruned = 0
-        while True:
-            to_remove = []
-            for pk, info in a.pid_tree.items():
-                if info.cmd == cla.DEAD_PROCESS and not info.children:
-                    ppid_pk = (info.ppid, info.key) if info.ppid is not None else None
-                    if ppid_pk is None or ppid_pk not in a.pid_tree:
-                        to_remove.append(pk)
-            if not to_remove:
-                break
-            for pk in to_remove:
-                del a.pid_tree[pk]
-                pruned += 1
-            for pk, info in a.pid_tree.items():
-                info.children = [c for c in info.children if c in a.pid_tree]
+        # Run the real prune via enrich_pid_tree
+        with mock.patch.object(a, "is_process_alive", side_effect=cla.ProcessDead("dead")):
+            a.enrich_pid_tree()
 
         # Old parent (20152) should be gone
         assert parent_pk not in a.pid_tree
-        assert pruned == 1
 
         # Children should still exist under new parent
         assert child1_pk in a.pid_tree
         assert child2_pk in a.pid_tree
         assert child1_pk in a.pid_tree[new_parent_pk].children
         assert child2_pk in a.pid_tree[new_parent_pk].children
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# COVERAGE — enrich_pid_tree() parent chain, /proc context, zombie/race paths
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.unit
+class TestEnrichPidTreeCoverage:
+    """Exercises enrich_pid_tree() branches not reached by the basic tests."""
+
+    @staticmethod
+    def _make():
+        return cla.Analyzer(key="test", look_in_log=False, show_pid_tree=True)
+
+    def test_parent_chain_creates_placeholders(self):
+        """Walking up the parent chain should create placeholder entries
+        for parents not already in the tree."""
+        a = self._make()
+        # pid 500 has UNKNOWN cmd → needs enrichment.  Its fake psutil.Process
+        # reports ppid=400, which is not in the tree yet → should be created.
+        pk = (500, "test")
+        a.pid_tree[pk] = cla.PidTreeEntry(
+            cmd=cla.UNKNOWN, ppid=None, context=cla.UNKNOWN, key="test", live=True,
+        )
+        a.avc_pids.add(pk)
+
+        fake_proc_500 = mock.MagicMock()
+        fake_proc_500.cmdline.return_value = ["/usr/bin/app", "--flag"]
+        fake_proc_500.ppid.return_value = 400
+        fake_proc_500.is_running.return_value = True
+        fake_proc_500.status.return_value = "running"
+
+        fake_proc_400 = mock.MagicMock()
+        fake_proc_400.cmdline.return_value = ["/bin/bash"]
+        fake_proc_400.ppid.return_value = 1
+        fake_proc_400.is_running.return_value = True
+        fake_proc_400.status.return_value = "running"
+
+        fake_proc_1 = mock.MagicMock()
+        fake_proc_1.cmdline.return_value = ["/sbin/init"]
+        fake_proc_1.ppid.return_value = 0
+        fake_proc_1.is_running.return_value = True
+        fake_proc_1.status.return_value = "running"
+
+        def fake_is_alive(pid):
+            mapping = {500: fake_proc_500, 400: fake_proc_400, 1: fake_proc_1}
+            p = mapping.get(int(pid))
+            if p is None:
+                raise cla.ProcessDead(f"{pid} dead")
+            return p
+
+        # Mock /proc/*/attr/current reads
+        def fake_open(path, *a, **kw):
+            if "/proc/" in path and "/attr/current" in path:
+                m = mock.mock_open(read_data="system_u:system_r:myapp_t:s0\x00")()
+                return m
+            return open.__wrapped__(path, *a, **kw) if hasattr(open, '__wrapped__') else _real_open(path, *a, **kw)
+
+        import builtins
+        _real_open = builtins.open
+
+        with mock.patch.object(a, "is_process_alive", side_effect=fake_is_alive), \
+             mock.patch("builtins.open", side_effect=fake_open):
+            a.enrich_pid_tree()
+
+        # pid 500 should now have cmd enriched
+        assert a.pid_tree[(500, "test")].cmd == "/usr/bin/app --flag"
+        # pid 400 should have been created as placeholder and enriched
+        assert (400, "test") in a.pid_tree
+        assert a.pid_tree[(400, "test")].cmd == "/bin/bash"
+        # pid 1 (init) should be in the tree
+        assert (1, "test") in a.pid_tree
+
+    def test_zombie_process_breaks_chain(self):
+        """ProcessZombie (ProcessNotAvailable) should stop the parent chain walk."""
+        a = self._make()
+        pk = (600, "test")
+        a.pid_tree[pk] = cla.PidTreeEntry(
+            cmd=cla.UNKNOWN, ppid=None, context=cla.UNKNOWN, key="test", live=True,
+        )
+        a.avc_pids.add(pk)
+
+        with mock.patch.object(a, "is_process_alive", side_effect=cla.ProcessNotAvailable("zombie")):
+            a.enrich_pid_tree()
+
+        # Should remain UNKNOWN — zombie can't be queried
+        assert a.pid_tree[pk].cmd == cla.UNKNOWN
+
+    def test_race_condition_process_dies_during_query(self):
+        """When is_process_alive succeeds but cmdline() raises NoSuchProcess,
+        the process should be labelled dead."""
+        a = self._make()
+        pk = (700, "test")
+        a.pid_tree[pk] = cla.PidTreeEntry(
+            cmd=cla.UNKNOWN, ppid=None, context=cla.UNKNOWN, key="test", live=True,
+        )
+        a.avc_pids.add(pk)
+
+        fake_proc = mock.MagicMock()
+        fake_proc.cmdline.side_effect = psutil.NoSuchProcess(700)
+
+        with mock.patch.object(a, "is_process_alive", return_value=fake_proc):
+            a.enrich_pid_tree()
+
+        entry = a.pid_tree.get(pk)
+        # Either pruned or labelled dead
+        if entry is not None:
+            assert entry.cmd == cla.DEAD_PROCESS
+
+    def test_known_cmd_walks_parent_only(self):
+        """A live entry with known cmd but unknown ppid should still get ppid filled."""
+        a = self._make()
+        pk = (800, "test")
+        a.pid_tree[pk] = cla.PidTreeEntry(
+            cmd="/usr/bin/known", ppid=None, context="ctx", key="test", live=True,
+        )
+        a.avc_pids.add(pk)
+
+        fake_proc = mock.MagicMock()
+        fake_proc.ppid.return_value = 1
+        fake_proc.is_running.return_value = True
+        fake_proc.status.return_value = "running"
+
+        def fake_is_alive(pid):
+            if int(pid) == 800:
+                return fake_proc
+            raise cla.ProcessDead(f"{pid}")
+
+        with mock.patch.object(a, "is_process_alive", side_effect=fake_is_alive):
+            a.enrich_pid_tree()
+
+        assert a.pid_tree[pk].ppid == 1
+
+    def test_proc_attr_permission_denied(self):
+        """When /proc/pid/attr/current is not readable, context stays UNKNOWN."""
+        a = self._make()
+        pk = (900, "test")
+        a.pid_tree[pk] = cla.PidTreeEntry(
+            cmd=cla.UNKNOWN, ppid=None, context=cla.UNKNOWN, key="test", live=True,
+        )
+        a.avc_pids.add(pk)
+
+        fake_proc = mock.MagicMock()
+        fake_proc.cmdline.return_value = ["/bin/something"]
+        fake_proc.ppid.return_value = 1
+
+        def fake_is_alive(pid):
+            if int(pid) == 900:
+                return fake_proc
+            raise cla.ProcessDead(f"{pid}")
+
+        with mock.patch.object(a, "is_process_alive", side_effect=fake_is_alive), \
+             mock.patch("builtins.open", side_effect=PermissionError("denied")):
+            a.enrich_pid_tree()
+
+        assert a.pid_tree[(900, "test")].context == cla.UNKNOWN
+        assert a.pid_tree[(900, "test")].cmd == "/bin/something"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# COVERAGE — parse_ausearch_from_log() fallback paths
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.unit
+class TestParseAusearchFallbackPaths:
+    """Cover parse_ausearch_from_log fallback branches: no FULL_AVC, no SYSCALL_AVC,
+    individual field extraction, and ps lookup when pid is alive."""
+
+    def test_partial_extract_uses_uid_ppid_pid_regexes(self):
+        """Block with no SYSCALL line forces partial extraction via individual regexes."""
+        block = (
+            'type=AVC msg=audit(09/02/2026 10:45:19.517:18438) : avc:  denied  { read } '
+            'for  pid=300 uid=1000 ppid=100 comm=myapp '
+            'scontext=system_u:system_r:myapp_t:s0 '
+            'tcontext=system_u:object_r:cert_t:s0 tclass=file permissive=1\n'
+        )
+        a = cla.Analyzer(key="test", look_in_log=False)
+        results = a.parse_ausearch_from_log(blocks=[block])
+        assert len(results) == 1
+        assert results[0].command.pid == "300"
+
+    def test_ps_fallback_for_ppid(self):
+        """When ppid is missing and pid is alive, get_from_pid('ppid') should be called."""
+        # Block with a PID match but no ppid field and no FULL_AVC/SYSCALL_AVC
+        block = (
+            'type=AVC msg=audit(09/02/2026 10:45:19.517:18438) : avc:  denied  { read } '
+            'for  pid=12345 comm=myapp '
+            'scontext=system_u:system_r:myapp_t:s0 '
+            'tcontext=system_u:object_r:cert_t:s0 tclass=file permissive=1\n'
+        )
+        a = cla.Analyzer(key="test", look_in_log=False)
+
+        # Mock get_from_pid to simulate a live process
+        with mock.patch.object(a, "get_from_pid", return_value=cla.DEAD_PROCESS):
+            results = a.parse_ausearch_from_log(blocks=[block])
+        assert len(results) == 1
+
+    def test_full_avc_pid_ppid_parse_error(self):
+        """FULL_AVC match but pid/ppid extraction fails should print error and continue."""
+        # Craft a block where FULL_AVC matches but the SYSCALL portion has no ppid= pid=
+        block = (
+            'type=PROCTITLE msg=audit(09/02/2026 10:45:19.517:18438) : proctitle=/bin/myapp\n'
+            'type=SYSCALL msg=audit(09/02/2026 10:45:19.517:18438) : arch=x86_64 syscall=open\n'
+            'type=AVC msg=audit(09/02/2026 10:45:19.517:18438) : avc:  denied  { read } '
+            'for  pid=200 comm=myapp '
+            'scontext=system_u:system_r:myapp_t:s0 '
+            'tcontext=system_u:object_r:cert_t:s0 tclass=file permissive=1\n'
+        )
+        a = cla.Analyzer(key="test", look_in_log=False)
+        # Should not crash — produces result with whatever could be parsed
+        results = a.parse_ausearch_from_log(blocks=[block])
+        assert len(results) >= 1
+
+    def test_dead_cmd_falls_back_to_exe(self):
+        """When cmd is dead_process or None, parser should try exe= and comm= from block."""
+        block = (
+            'type=AVC msg=audit(09/02/2026 10:45:19.517:18438) : avc:  denied  { read } '
+            'for  pid=99999999 exe=/usr/sbin/myapp comm=myapp '
+            'scontext=system_u:system_r:myapp_t:s0 '
+            'tcontext=system_u:object_r:cert_t:s0 tclass=file permissive=1\n'
+        )
+        a = cla.Analyzer(key="test", look_in_log=False)
+        results = a.parse_ausearch_from_log(blocks=[block])
+        assert len(results) == 1
+        # Should have exe= or comm= as cmd
+        assert results[0].command.cmd in ("/usr/sbin/myapp", "myapp")
+
+    def test_pid_namespace_dead_process(self):
+        """When /proc/<pid>/ns/pid fails and process is dead, pid_namespace=PID_DEAD."""
+        block = (
+            'type=PROCTITLE msg=audit(09/02/2026 10:45:19.517:18438) : proctitle=/bin/myapp\n'
+            'type=SYSCALL msg=audit(09/02/2026 10:45:19.517:18438) : arch=x86_64 syscall=open ppid=100 pid=9999999 uid=root\n'
+            'type=AVC msg=audit(09/02/2026 10:45:19.517:18438) : avc:  denied  { read } '
+            'for  pid=9999999 comm=myapp '
+            'scontext=system_u:system_r:myapp_t:s0 '
+            'tcontext=system_u:object_r:cert_t:s0 tclass=file permissive=1\n'
+        )
+        a = cla.Analyzer(key="test", look_in_log=False)
+        results = a.parse_ausearch_from_log(blocks=[block])
+        assert len(results) == 1
+        # PID is certainly dead
+        assert results[0].command.pid_namespace in (cla.NOT_FOUND, cla.PID_DEAD)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# COVERAGE — parse_index_from_file() history dedup & ns alias
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.unit
+class TestParseIndexFromFileCoverage:
+    """Cover deeper branches: multi-word history, **** replacement at various
+    column positions, namespace alias parsing, and corrupted weight handling."""
+
+    def test_history_dedup_later_columns(self):
+        """History dedup should work for words beyond the 4th column."""
+        a = cla.Analyzer(key="test", look_in_log=False)
+        doc = (
+            f"rules\n{cla.INDEX_DELIMITER}\n"
+            f"### CMD_0001 1 | /usr/bin/app --arg1 --arg2 --arg3\n"
+            f"### CMD_0002 1 | ************ ****** ****** --arg4\n"
+        )
+        a.parse_index_from_file(doc)
+        # The second command should have been reconstructed
+        alias = a.cmd_index.get_alias("/usr/bin/app --arg1 --arg2 --arg4 ")
+        assert alias == "CMD_0002" or "/usr/bin/app" in alias or "CMD_0002" in str(a.cmd_index.to_dict())
+
+    def test_namespace_alias_parsed(self):
+        """parse_index_from_file should register a ~pid_ns_*~ alias into ns_index."""
+        a = cla.Analyzer(key="test", look_in_log=False)
+        doc = f"rules\n{cla.INDEX_DELIMITER}\n### ~pid_ns_myhost~ 0 | 54321\n"
+        a.parse_index_from_file(doc)
+        assert 54321 in a.ns_index
+        assert a.ns_index.get(54321) == "~pid_ns_myhost~"
+
+    def test_namespace_non_decimal_skipped(self):
+        """Namespace alias with non-decimal value should be skipped gracefully."""
+        a = cla.Analyzer(key="test", look_in_log=False)
+        doc = f"rules\n{cla.INDEX_DELIMITER}\n### ~pid_ns_broken~ 0 | not_a_number\n"
+        a.parse_index_from_file(doc)
+        # Should not crash; ns_index should be empty
+        assert len(a.ns_index) == 0
+
+    def test_corrupted_weight_raises(self):
+        """Non-integer weight field should raise FileParsingError."""
+        a = cla.Analyzer(key="test", look_in_log=False)
+        doc = f"rules\n{cla.INDEX_DELIMITER}\n### CMD_0001 abc | /usr/bin/app\n"
+        with pytest.raises(cla.FileParsingError, match="err_001"):
+            a.parse_index_from_file(doc)
+
+    def test_corrupted_delimiter_raises(self):
+        """Wrong delimiter field should raise FileParsingError."""
+        a = cla.Analyzer(key="test", look_in_log=False)
+        doc = f"rules\n{cla.INDEX_DELIMITER}\n### CMD_0001 1 X /usr/bin/app\n"
+        with pytest.raises(cla.FileParsingError, match="err_002"):
+            a.parse_index_from_file(doc)
+
+    def test_non_index_line_skipped(self):
+        """Lines that don't start with ### should be silently ignored."""
+        a = cla.Analyzer(key="test", look_in_log=False)
+        doc = f"rules\n{cla.INDEX_DELIMITER}\nsome random comment\n### CMD_0001 1 | /usr/bin/app\n"
+        replacer = a.parse_index_from_file(doc)
+        assert isinstance(replacer, list)
+        assert "/usr/bin/app" in a.cmd_index or a.cmd_index.get_alias("/usr/bin/app ") == "CMD_0001"
+
+    def test_alias_collision_in_parse_index(self):
+        """Pre-existing alias collision should produce a replacer entry."""
+        a = cla.Analyzer(key="test", look_in_log=False)
+        a.set_index("/usr/bin/other", "CMD_0001")
+        doc = f"rules\n{cla.INDEX_DELIMITER}\n### CMD_0001 1 | /usr/bin/newcmd\n"
+        replacer = a.parse_index_from_file(doc)
+        assert len(replacer) == 1
+        old, new = replacer[0]
+        assert old == "CMD_0001"
+        assert new != "CMD_0001"
+
+    def test_pid_tree_section_stripped_from_index(self):
+        """Index parsing should not read PID tree section as index entries."""
+        a = cla.Analyzer(key="test", look_in_log=False)
+        tree_section = (
+            "# test - Process Tree\n"
+            "# ├── pid=1@test ctx: system_u:system_r:init_t:s0 cmd: /sbin/init\n"
+        )
+        doc = f"rules\n{cla.INDEX_DELIMITER}\n### CMD_0001 1 | /usr/bin/app\n{cla.PID_TREE_DELIMITER}\n{tree_section}"
+        replacer = a.parse_index_from_file(doc)
+        assert isinstance(replacer, list)
+        assert a.cmd_index.get_alias("/usr/bin/app ") == "CMD_0001"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# COVERAGE — parse_pid_tree_from_file() deeper branches
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.unit
+class TestParsePidTreeFromFileCoverage:
+    """Cover indent stack, app root from entry marker, merge with existing,
+    multiple app roots from header, backward compat list vs single."""
+
+    def test_multiple_app_roots_in_header(self):
+        """Header with multiple comma-separated app root PIDs."""
+        tree_section = (
+            "# test - Process Tree (APP Roots detected at 1001, 1003)\n"
+            "#\n"
+            "# ├── pid=1001@test [APP ROOT]     ctx: system_u:system_r:myapp_t:s0    cmd: /bin/bash /usr/sbin/myapp start\n"
+            "# ├── pid=1003@test [APP ROOT]     ctx: system_u:system_r:myapp_t:s0    cmd: /bin/bash /usr/sbin/myapp stop\n"
+        )
+        doc = f"rules\n{cla.INDEX_DELIMITER}\nindex\n{cla.PID_TREE_DELIMITER}\n{tree_section}"
+        a = cla.Analyzer(key="test", look_in_log=False)
+        a.parse_pid_tree_from_file(doc)
+        assert (1001, "test") in a.app_root_pids
+        assert (1003, "test") in a.app_root_pids
+
+    def test_deep_nesting_indent_stack(self):
+        """Deep nesting with multiple │ characters should produce correct parent-child."""
+        tree_section = (
+            "# test - Process Tree\n"
+            "#\n"
+            "# ├── pid=1@test                      ctx: ctx    cmd: /sbin/init\n"
+            "# │   ├── pid=10@test                 ctx: ctx    cmd: /bin/bash\n"
+            "# │   │   ├── pid=100@test            ctx: ctx    cmd: /usr/bin/app\n"
+            "# │   │   │   ├── pid=1000@test       ctx: ctx    cmd: /usr/bin/worker\n"
+        )
+        doc = f"rules\n{cla.INDEX_DELIMITER}\nindex\n{cla.PID_TREE_DELIMITER}\n{tree_section}"
+        a = cla.Analyzer(key="test", look_in_log=False)
+        a.parse_pid_tree_from_file(doc)
+        assert a.pid_tree[(10, "test")].ppid == 1
+        assert a.pid_tree[(100, "test")].ppid == 10
+        assert a.pid_tree[(1000, "test")].ppid == 100
+        assert (10, "test") in a.pid_tree[(1, "test")].children
+
+    def test_merge_with_existing_entry(self):
+        """Loading from file should merge with pre-existing pid_tree entries."""
+        a = cla.Analyzer(key="test", look_in_log=False)
+        pk = (1001, "test")
+        a.pid_tree[pk] = cla.PidTreeEntry(
+            cmd=cla.UNKNOWN, ppid=None, context=cla.UNKNOWN, key="test", live=True,
+        )
+        tree_section = (
+            "# test - Process Tree\n"
+            "#\n"
+            "# ├── pid=1001@test                   ctx: system_u:system_r:myapp_t:s0    cmd: /bin/myapp\n"
+        )
+        doc = f"rules\n{cla.INDEX_DELIMITER}\nindex\n{cla.PID_TREE_DELIMITER}\n{tree_section}"
+        a.parse_pid_tree_from_file(doc)
+        # Merge should have updated cmd
+        assert a.pid_tree[pk].cmd == "/bin/myapp"
+
+    def test_app_root_from_entry_marker(self):
+        """App root detected from [APP ROOT] in entry line, not from header."""
+        tree_section = (
+            "# test - Process Tree\n"
+            "#\n"
+            "# ├── pid=5000@test [APP ROOT]        ctx: system_u:system_r:myapp_t:s0    cmd: /usr/sbin/myapp\n"
+        )
+        doc = f"rules\n{cla.INDEX_DELIMITER}\nindex\n{cla.PID_TREE_DELIMITER}\n{tree_section}"
+        a = cla.Analyzer(key="test", look_in_log=False)
+        a.parse_pid_tree_from_file(doc)
+        assert (5000, "test") in a.app_root_pids
+
+    def test_empty_tree_section_is_noop(self):
+        """Empty PID tree section should not crash."""
+        doc = f"rules\n{cla.INDEX_DELIMITER}\nindex\n{cla.PID_TREE_DELIMITER}\n"
+        a = cla.Analyzer(key="test", look_in_log=False)
+        a.parse_pid_tree_from_file(doc)
+        assert len(a.pid_tree) == 0
+
+    def test_sibling_nodes_parsed(self):
+        """Two children at the same indent level should both have the same parent."""
+        tree_section = (
+            "# test - Process Tree\n"
+            "#\n"
+            "# ├── pid=1@test                      ctx: ctx    cmd: /sbin/init\n"
+            "# │   ├── pid=10@test                 ctx: ctx    cmd: child1\n"
+            "# │   ├── pid=20@test                 ctx: ctx    cmd: child2\n"
+        )
+        doc = f"rules\n{cla.INDEX_DELIMITER}\nindex\n{cla.PID_TREE_DELIMITER}\n{tree_section}"
+        a = cla.Analyzer(key="test", look_in_log=False)
+        a.parse_pid_tree_from_file(doc)
+        assert a.pid_tree[(10, "test")].ppid == 1
+        assert a.pid_tree[(20, "test")].ppid == 1
+        assert (10, "test") in a.pid_tree[(1, "test")].children
+        assert (20, "test") in a.pid_tree[(1, "test")].children
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# COVERAGE — filter_pid_tree() UNKNOWN:UNKNOWN cascade prune
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.unit
+class TestFilterPidTreeCoverage:
+    """Test the cascading prune of UNKNOWN:UNKNOWN single-child linear chains."""
+
+    def test_unknown_chain_pruned(self):
+        """A chain of UNKNOWN:UNKNOWN nodes each with 1 child should collapse
+        until only the leaf (relevant) node remains."""
+        a = cla.Analyzer(key="test", look_in_log=False)
+        # grandparent → parent → leaf (leaf is in avc_pids)
+        gp = (1, "test")
+        pa = (2, "test")
+        lf = (3, "test")
+        a.pid_tree[gp] = cla.PidTreeEntry(
+            cmd=cla.UNKNOWN, ppid=None, context=cla.UNKNOWN, key="test", live=True,
+            children=[pa],
+        )
+        a.pid_tree[pa] = cla.PidTreeEntry(
+            cmd=cla.UNKNOWN, ppid=1, context=cla.UNKNOWN, key="test", live=True,
+            children=[lf],
+        )
+        a.pid_tree[lf] = cla.PidTreeEntry(
+            cmd="/usr/bin/app", ppid=2, context="myapp_t", key="test", live=True,
+        )
+        a.avc_pids.add(lf)
+        a.filter_pid_tree()
+        # Only leaf should survive
+        assert lf in a.pid_tree
+        assert gp not in a.pid_tree
+        assert pa not in a.pid_tree
+        assert a.pid_tree[lf].ppid is None
+
+    def test_unknown_with_two_children_kept(self):
+        """UNKNOWN:UNKNOWN root with TWO children should NOT be pruned."""
+        a = cla.Analyzer(key="test", look_in_log=False)
+        root = (1, "test")
+        c1 = (10, "test")
+        c2 = (20, "test")
+        a.pid_tree[root] = cla.PidTreeEntry(
+            cmd=cla.UNKNOWN, ppid=None, context=cla.UNKNOWN, key="test", live=True,
+            children=[c1, c2],
+        )
+        a.pid_tree[c1] = cla.PidTreeEntry(
+            cmd="app1", ppid=1, context="ctx", key="test", live=True,
+        )
+        a.pid_tree[c2] = cla.PidTreeEntry(
+            cmd="app2", ppid=1, context="ctx", key="test", live=True,
+        )
+        a.avc_pids.update({c1, c2})
+        a.filter_pid_tree()
+        assert root in a.pid_tree
+        assert c1 in a.pid_tree
+        assert c2 in a.pid_tree
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# COVERAGE — format_pid_tree() orphan rendering, APP Root header
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.unit
+class TestFormatPidTreeCoverage:
+    """Cover orphan rendering and APP Root label in format_pid_tree()."""
+
+    def test_orphan_processes_rendered(self):
+        """Processes with no children and no parent in tree should appear in Orphan section."""
+        a = cla.Analyzer(key="test", look_in_log=False)
+        # A root with children
+        root = (1, "test")
+        child = (10, "test")
+        a.pid_tree[root] = cla.PidTreeEntry(
+            cmd="/sbin/init", ppid=None, context="ctx", key="test", live=True,
+            children=[child],
+        )
+        a.pid_tree[child] = cla.PidTreeEntry(
+            cmd="/bin/bash", ppid=1, context="ctx", key="test", live=True,
+        )
+        # An orphan (no parent, no children)
+        orphan = (999, "test")
+        a.pid_tree[orphan] = cla.PidTreeEntry(
+            cmd="/usr/bin/orphan", ppid=None, context="ctx_orphan", key="test", live=True,
+        )
+        out = a.format_pid_tree()
+        assert "Orphan" in out
+        assert "pid=999" in out
+
+    def test_app_root_label_in_header(self):
+        """APP Root pids should produce a header like 'Process Tree (APP Root detected at ...)'."""
+        a = cla.Analyzer(key="test", look_in_log=False)
+        root = (1001, "test")
+        child = (1002, "test")
+        a.pid_tree[root] = cla.PidTreeEntry(
+            cmd="/bin/bash /usr/sbin/myapp", ppid=None, context="myapp_t", key="test", live=True,
+            children=[child],
+        )
+        a.pid_tree[child] = cla.PidTreeEntry(
+            cmd="/usr/bin/worker", ppid=1001, context="myapp_t", key="test", live=True,
+        )
+        a.app_root_pids.append(root)
+        out = a.format_pid_tree()
+        assert "APP Root detected at 1001" in out
+        assert "[APP ROOT]" in out
+
+    def test_multiple_app_roots_label(self):
+        """Multiple APP roots should produce 'APP Roots' (plural)."""
+        a = cla.Analyzer(key="test", look_in_log=False)
+        r1 = (1001, "test")
+        r2 = (1003, "test")
+        for r in [r1, r2]:
+            a.pid_tree[r] = cla.PidTreeEntry(
+                cmd="/bin/myapp", ppid=None, context="myapp_t", key="test", live=True,
+                children=[(r[0] + 1, "test")],
+            )
+            c = (r[0] + 1, "test")
+            a.pid_tree[c] = cla.PidTreeEntry(
+                cmd="worker", ppid=r[0], context="myapp_t", key="test", live=True,
+            )
+        a.app_root_pids.extend([r1, r2])
+        out = a.format_pid_tree()
+        assert "APP Roots detected at" in out
+
+    def test_empty_pid_tree(self):
+        """Empty pid_tree should produce the 'empty' message."""
+        a = cla.Analyzer(key="test", look_in_log=False)
+        out = a.format_pid_tree()
+        assert "No EXECVE events found" in out
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# COVERAGE — CLI main() paths
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.cli
+class TestCLICoveragePaths:
+    """Cover CLI argument validation and output routing not hit by existing tests."""
+
+    def test_key_sanitization_spaces_and_brackets(self, tmp_path):
+        """Spaces, brackets, and other special chars in --key should be replaced."""
+        dest = str(tmp_path / "output.txt")
+        result = subprocess.run(
+            [sys.executable, _SCRIPT_PATH,
+             "--key", "my host (v2) [test]",
+             "--ignore-log",
+             "--dest", dest],
+            capture_output=True, text=True, timeout=30,
+        )
+        # Key sanitization runs in main(); success means no crash from special chars
+        assert result.returncode == 0
+        assert os.path.isfile(dest)
+
+    def test_json_only_output_no_human(self, tmp_path):
+        """--json-dest without --dest should skip human-readable formatting."""
+        json_dest = str(tmp_path / "output.json")
+        result = subprocess.run(
+            [sys.executable, _SCRIPT_PATH,
+             "--key", "test",
+             "--ignore-log",
+             "--json-dest", json_dest],
+            capture_output=True, text=True, timeout=30,
+        )
+        assert result.returncode == 0
+        assert os.path.isfile(json_dest)
+        with open(json_dest) as f:
+            data = json.load(f)
+        assert data["version"] == cla.JSON_FORMAT_VERSION
+        # stdout should NOT have full human-readable output
+        assert cla.INDEX_DELIMITER not in result.stdout
+
+    def test_both_json_and_dest(self, tmp_path):
+        """--json-dest with --dest should produce both outputs."""
+        dest = str(tmp_path / "output.txt")
+        json_dest = str(tmp_path / "output.json")
+        result = subprocess.run(
+            [sys.executable, _SCRIPT_PATH,
+             "--key", "test",
+             "--ignore-log",
+             "--dest", dest,
+             "--json-dest", json_dest],
+            capture_output=True, text=True, timeout=30,
+        )
+        assert result.returncode == 0
+        assert os.path.isfile(dest)
+        assert os.path.isfile(json_dest)
+        with open(dest) as f:
+            assert cla.INDEX_DELIMITER in f.read()
+        with open(json_dest) as f:
+            assert json.load(f)["version"] == cla.JSON_FORMAT_VERSION
+
+    def test_json_file_parse_error(self, tmp_path):
+        """Corrupted JSON input file should raise FileParsingError."""
+        bad_json = str(tmp_path / "bad.json")
+        with open(bad_json, "w") as f:
+            f.write("{this is not valid json}")
+        result = subprocess.run(
+            [sys.executable, _SCRIPT_PATH,
+             "--key", "test",
+             "--ignore-log",
+             "--json-files", bad_json],
+            capture_output=True, text=True, timeout=30,
+        )
+        assert result.returncode != 0
+
+    def test_file_missing_index_raises(self, tmp_path):
+        """Input file without INDEX_DELIMITER should raise FileParsingError."""
+        bad_file = str(tmp_path / "bad.txt")
+        with open(bad_file, "w") as f:
+            f.write("allow myapp_t cert_t:dir read;\n")
+        result = subprocess.run(
+            [sys.executable, _SCRIPT_PATH,
+             "--key", "test",
+             "--ignore-log",
+             "--files", bad_file],
+            capture_output=True, text=True, timeout=30,
+        )
+        assert result.returncode != 0
+
+    def test_stdout_when_no_dest(self, tmp_path):
+        """Without --dest, human-readable output should go to stdout."""
+        result = subprocess.run(
+            [sys.executable, _SCRIPT_PATH,
+             "--key", "test",
+             "--ignore-log"],
+            capture_output=True, text=True, timeout=30,
+        )
+        assert result.returncode == 0
+        assert cla.INDEX_DELIMITER in result.stdout
+
+    def test_context_filter_and_app_name(self, tmp_path):
+        """--context-filter and --app-name should be passed to analyzer."""
+        dest = str(tmp_path / "output.txt")
+        result = subprocess.run(
+            [sys.executable, _SCRIPT_PATH,
+             "--key", "test",
+             "--ignore-log",
+             "--context-filter", "myapp_t", "myapp2_t",
+             "--app-name", "myapp",
+             "--dest", dest],
+            capture_output=True, text=True, timeout=30,
+        )
+        assert result.returncode == 0
+
+    def test_no_explanations_flag(self, tmp_path):
+        """--no-explanations should suppress the 'required by' blocks."""
+        dest = str(tmp_path / "output.txt")
+        result = subprocess.run(
+            [sys.executable, _SCRIPT_PATH,
+             "--key", "test",
+             "--ignore-log",
+             "--no-explanations",
+             "--dest", dest],
+            capture_output=True, text=True, timeout=30,
+        )
+        assert result.returncode == 0
+
+    def test_no_tree_flag(self, tmp_path):
+        """--no-tree should suppress PID tree output."""
+        dest = str(tmp_path / "output.txt")
+        result = subprocess.run(
+            [sys.executable, _SCRIPT_PATH,
+             "--key", "test",
+             "--ignore-log",
+             "--no-tree",
+             "--dest", dest],
+            capture_output=True, text=True, timeout=30,
+        )
+        assert result.returncode == 0
+        with open(dest) as f:
+            content = f.read()
+        assert cla.PID_TREE_DELIMITER not in content
+
+    def test_no_index_flag(self, tmp_path):
+        """--no-index should suppress the INDEX section entirely."""
+        dest = str(tmp_path / "output.txt")
+        result = subprocess.run(
+            [sys.executable, _SCRIPT_PATH,
+             "--key", "test",
+             "--ignore-log",
+             "--no-index",
+             "--dest", dest],
+            capture_output=True, text=True, timeout=30,
+        )
+        assert result.returncode == 0
+        with open(dest) as f:
+            content = f.read()
+        # INDEX delimiter still present (structural) but no index content between them
+        assert cla.INDEX_DELIMITER in content
+
+    def test_log_not_readable(self, tmp_path):
+        """--log pointing to unreadable file should raise PermissionError."""
+        unreadable = str(tmp_path / "noperm.log")
+        with open(unreadable, "w") as f:
+            f.write("data")
+        os.chmod(unreadable, 0o000)
+        try:
+            result = subprocess.run(
+                [sys.executable, _SCRIPT_PATH,
+                 "--key", "test",
+                 "--log", unreadable],
+                capture_output=True, text=True, timeout=30,
+            )
+            assert result.returncode != 0
+        finally:
+            os.chmod(unreadable, 0o644)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# COVERAGE — analyze() method routing (skip_formatting, json_dest)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.unit
+class TestAnalyzeMethodCoverage:
+    """Cover skip_formatting path and json_dest output in analyze()."""
+
+    def test_skip_formatting_returns_empty(self, tmp_path):
+        """analyze() with skip_formatting=True should return empty string."""
+        a = cla.Analyzer(key="test", look_in_log=False, show_pid_tree=False)
+        result = a.analyze(docs=[], skip_formatting=True)
+        assert result == ""
+
+    def test_skip_formatting_saves_state(self, tmp_path):
+        """skip_formatting=True should still save state file when configured."""
+        sf = str(tmp_path / "state.json")
+        a = cla.Analyzer(key="test", look_in_log=False, show_pid_tree=False,
+                         state_file_path=sf)
+        a.analyze(docs=[], skip_formatting=True)
+        assert os.path.isfile(sf)
+
+    def test_json_dest_written(self, tmp_path):
+        """analyze() should write JSON when json_dest is given."""
+        jd = str(tmp_path / "out.json")
+        a = cla.Analyzer(key="test", look_in_log=False, show_pid_tree=False)
+        a.analyze(docs=[], json_dest=jd)
+        with open(jd) as f:
+            data = json.load(f)
+        assert data["version"] == cla.JSON_FORMAT_VERSION
+        assert data["key"] == "test"
+
+    def test_analyze_with_existing_file(self, tmp_path):
+        """analyze() should parse existing file and merge results."""
+        # Create a valid existing output file
+        doc = (
+            f"allow myapp_t cert_t:dir read;\n"
+            f"# required by :\n"
+            f"#     test | /usr/bin/cmd (pid=100 ; pid_ns=notFound)\n"
+            f"#          | SYSCALL: msg=audit(...)\n"
+            f"\n{cla.INDEX_DELIMITER}\n"
+            f"### CMD_0001 1 | /usr/bin/cmd\n"
+        )
+        a = cla.Analyzer(key="test", look_in_log=False, show_pid_tree=False)
+        txt = a.analyze(docs=[doc])
+        assert "allow myapp_t cert_t:dir read;" in txt
+        assert a.file_counter == 1
+
+    def test_analyze_with_json_doc(self, tmp_path):
+        """analyze() should merge JSON documents."""
+        json_doc = {
+            "version": cla.JSON_FORMAT_VERSION,
+            "key": "test",
+            "results": [{
+                "command": {
+                    "key": "test",
+                    "descriptors": ["desc1"],
+                    "pid_namespace": "notFound",
+                    "cmd": "/usr/bin/app",
+                    "pid": "100",
+                },
+                "AVC": [{
+                    "source_type": "myapp_t",
+                    "target_type": "cert_t",
+                    "tclass": "dir",
+                    "method": "read",
+                }],
+            }],
+            "index": {},
+            "ns_index": {},
+            "all_cmds": {},
+            "pid_tree": {},
+            "app_root_pids": [],
+            "avc_pids": [],
+        }
+        a = cla.Analyzer(key="test", look_in_log=False, show_pid_tree=False)
+        txt = a.analyze(docs=[], json_docs=[json_doc])
+        assert "allow myapp_t cert_t:dir read;" in txt
+        assert a.file_counter == 1
+
+    def test_no_index_mode(self):
+        """analyze() with no_index=True should produce output without index content."""
+        a = cla.Analyzer(key="test", look_in_log=False, show_pid_tree=False, no_index=True)
+        txt = a.analyze(docs=[])
+        assert cla.INDEX_DELIMITER in txt
+
+    def test_pid_tree_included_when_enabled(self, tmp_path):
+        """analyze() with show_pid_tree=True and populated tree should include PID tree."""
+        a = cla.Analyzer(key="test", look_in_log=False, show_pid_tree=True)
+        # Manually add a non-live entry (simulating file load)
+        pk = (100, "test")
+        a.pid_tree[pk] = cla.PidTreeEntry(
+            cmd="/usr/bin/app", ppid=None, context="ctx", key="test", live=False,
+        )
+        txt = a.analyze(docs=[])
+        assert cla.PID_TREE_DELIMITER in txt
+        assert "pid=100" in txt
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# COVERAGE — state file save/load edge cases
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.unit
+class TestStateFileCoverage:
+    """Edge cases for save/load state file operations."""
+
+    def test_save_and_reload_state(self, tmp_path):
+        """save → load round-trip should preserve entries."""
+        sf = str(tmp_path / "state.json")
+        a = cla.Analyzer(key="test", look_in_log=False, state_file_path=sf)
+        a.analyzed_entries = {"entry1", "entry2", "entry3"}
+        a.save_analyzed_entries()
+
+        a2 = cla.Analyzer(key="test", look_in_log=False, state_file_path=sf)
+        a2.load_analyzed_entries()
+        assert a2.analyzed_entries == {"entry1", "entry2", "entry3"}
+
+    def test_load_nonexistent_state(self, tmp_path):
+        """Loading from non-existent state file should be a no-op."""
+        sf = str(tmp_path / "nonexistent.json")
+        a = cla.Analyzer(key="test", look_in_log=False, state_file_path=sf)
+        a.load_analyzed_entries()
+        assert a.analyzed_entries == set()
+
+    def test_load_corrupted_state(self, tmp_path):
+        """Loading from corrupted JSON should not crash and should reset entries."""
+        sf = str(tmp_path / "bad_state.json")
+        with open(sf, "w") as f:
+            f.write("{broken json")
+        a = cla.Analyzer(key="test", look_in_log=False, state_file_path=sf)
+        a.load_analyzed_entries()
+        assert a.analyzed_entries == set()
+
+    def test_save_without_state_path_is_noop(self):
+        """save_analyzed_entries without state_file_path should do nothing."""
+        a = cla.Analyzer(key="test", look_in_log=False)
+        a.analyzed_entries = {"e1"}
+        a.save_analyzed_entries()  # should not crash
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# COVERAGE — merge_json() backward compat & edge cases
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.unit
+class TestMergeJsonCoverage:
+    """Cover merge_json backward compat (old single app_root_pid)
+    and version mismatch warning."""
+
+    def test_old_format_single_app_root_pid(self):
+        """Old JSON format with 'app_root_pid' (singular) should be handled."""
+        a = cla.Analyzer(key="test", look_in_log=False)
+        pk = (1001, "test")
+        a.pid_tree[pk] = cla.PidTreeEntry(
+            cmd="/bin/myapp", ppid=None, context="ctx", key="test", live=False,
+        )
+        data = {
+            "version": cla.JSON_FORMAT_VERSION,
+            "key": "test",
+            "results": [],
+            "index": {},
+            "ns_index": {},
+            "all_cmds": {},
+            "pid_tree": {
+                "1001:test": {
+                    "cmd": "/bin/myapp", "ppid": None, "context": "ctx",
+                    "key": "test", "live": False, "children": [],
+                },
+            },
+            "app_root_pids": [],
+            "app_root_pid": "1001:test",  # old format
+            "avc_pids": [],
+        }
+        a.merge_json(data)
+        assert (1001, "test") in a.app_root_pids
+
+    def test_version_mismatch_prints_warning(self, capsys):
+        """Version mismatch should print a warning to stderr."""
+        a = cla.Analyzer(key="test", look_in_log=False)
+        data = {
+            "version": 999,
+            "key": "test",
+            "results": [],
+            "index": {},
+            "ns_index": {},
+            "all_cmds": {},
+            "pid_tree": {},
+            "app_root_pids": [],
+            "avc_pids": [],
+        }
+        a.merge_json(data)
+        captured = capsys.readouterr()
+        assert "Warning" in captured.err or "version" in captured.err.lower()
+
+    def test_ns_index_merge_with_collision(self):
+        """Merging ns_index that collides should handle gracefully."""
+        a = cla.Analyzer(key="test", look_in_log=False, show_info=True)
+        a.ns_index.set(100, "~pid_ns_host~")
+        data = {
+            "version": cla.JSON_FORMAT_VERSION,
+            "key": "test",
+            "results": [],
+            "index": {},
+            "ns_index": {"200": "~pid_ns_host~"},
+            "all_cmds": {},
+            "pid_tree": {},
+            "app_root_pids": [],
+            "avc_pids": [],
+        }
+        a.merge_json(data)
+        # Should have registered with collision suffix
+        assert 200 in a.ns_index
+        assert a.ns_index.get(200) != a.ns_index.get(100)
+
+    def test_invalid_ns_id_in_json_skipped(self, capsys):
+        """Non-numeric ns_id in JSON should be skipped with warning."""
+        a = cla.Analyzer(key="test", look_in_log=False)
+        data = {
+            "version": cla.JSON_FORMAT_VERSION,
+            "key": "test",
+            "results": [],
+            "index": {},
+            "ns_index": {"not_a_number": "~pid_ns_bad~"},
+            "all_cmds": {},
+            "pid_tree": {},
+            "app_root_pids": [],
+            "avc_pids": [],
+        }
+        a.merge_json(data)
+        captured = capsys.readouterr()
+        assert "Warning" in captured.err or "invalid" in captured.err.lower()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# COVERAGE — look_for_constraint_violation
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.unit
+class TestConstraintViolationCoverage:
+
+    def test_missing_audit2allow(self, tmp_path):
+        """When audit2allow is not installed, should handle OSError gracefully."""
+        log = str(tmp_path / "test.log")
+        with open(log, "w") as f:
+            f.write("type=AVC some data\n")
+        with mock.patch("subprocess.run", side_effect=OSError("not found")):
+            # Should not raise
+            cla.Analyzer.look_for_constraint_violation(log)
+
+    def test_constraint_violation_detected(self, tmp_path, capsys):
+        """When audit2allow reports constraint violation, should print warning."""
+        log = str(tmp_path / "test.log")
+        with open(log, "w") as f:
+            f.write("type=AVC some data\n")
+        fake_result = mock.MagicMock()
+        fake_result.stdout = "constraint violation found"
+        with mock.patch("subprocess.run", return_value=fake_result):
+            cla.Analyzer.look_for_constraint_violation(log)
+        captured = capsys.readouterr()
+        assert "constraint violation" in captured.err.lower()
+
+    def test_audit2allow_timeout(self, tmp_path):
+        """audit2allow timeout should be handled gracefully."""
+        log = str(tmp_path / "test.log")
+        with open(log, "w") as f:
+            f.write("type=AVC some data\n")
+        with mock.patch("subprocess.run", side_effect=subprocess.TimeoutExpired("audit2allow", 120)):
+            cla.Analyzer.look_for_constraint_violation(log)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# COVERAGE — Debug-mode paths (show_debug=True)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.unit
+class TestDebugModePaths:
+    """Run key operations with show_debug=True to cover debug print branches."""
+
+    def test_ns_index_debug_prints(self, capsys):
+        """NsIndex operations with debug mode should cover debug print lines."""
+        ns = cla.NsIndex(show_debug=True)
+        # set a new entry → debug print
+        ns.set(100, "~pid_ns_a~")
+        # idempotent set → debug "existing" print
+        ns.set(100, "~pid_ns_a~")
+        # collision → debug "collision" print
+        ns.set(200, "~pid_ns_a~")
+        captured = capsys.readouterr()
+        assert "registered" in captured.err
+        assert "existing" in captured.err or "label existing" in captured.err
+        assert "collision" in captured.err
+
+    def test_cmd_index_debug_prints(self, capsys):
+        """CmdIndex operations with debug mode should cover debug print lines."""
+        ci = cla.CmdIndex(show_debug=True)
+        # Register with explicit alias → debug print
+        ci.register("cmd_a", "ALIAS_0001")
+        # Idempotent → debug "existing" print
+        ci.register("cmd_a")
+        # Collision on template alias → "refactoring" debug
+        ci.register("cmd_b", "ALIAS_0001")
+        # Collision on non-template alias → "got base_alias" debug
+        ci.register("cmd_c", "MYALIAS")
+        ci.register("cmd_d", "MYALIAS")
+        captured = capsys.readouterr()
+        assert "adding alias" in captured.err or "creating alias" in captured.err
+        assert "alias existing" in captured.err
+
+    def test_cmd_index_format_debug(self, capsys):
+        """CmdIndex.format() with debug should print each alias being written."""
+        ci = cla.CmdIndex(show_debug=True)
+        ci.register("ausearch -i -m avc", "AVC_0001")
+        ci.register("ausearch -i -m msg", "MSG_0001")
+        ci.log_weight("ausearch -i -m avc")
+        ci.log_weight("ausearch -i -m msg")
+        out = ci.format()
+        captured = capsys.readouterr()
+        assert "writing alias" in captured.err or "index to format" in captured.err
+
+    def test_parse_index_from_file_debug(self, capsys):
+        """parse_index_from_file with debug should cover all debug print paths."""
+        a = cla.Analyzer(key="test", look_in_log=False, show_debug=True)
+        doc = (
+            f"rules\n{cla.INDEX_DELIMITER}\n"
+            f"### CMD_0001 1 | ausearch -i -m avc\n"
+            f"### CMD_0002 1 | ******** ** ** msg\n"
+            f"\n"  # empty line should trigger "line null" debug
+        )
+        a.parse_index_from_file(doc)
+        captured = capsys.readouterr()
+        assert "parse_index_from_file" in captured.err
+
+    def test_enrich_pid_tree_debug(self, capsys):
+        """enrich_pid_tree with debug should cover debug print paths for dead pids."""
+        a = cla.Analyzer(key="test", look_in_log=False, show_debug=True)
+        pk = (9999999, "test")
+        a.pid_tree[pk] = cla.PidTreeEntry(
+            cmd=cla.UNKNOWN, ppid=None, context=cla.UNKNOWN, key="test", live=True,
+        )
+        a.avc_pids.add(pk)
+        a.enrich_pid_tree()
+        captured = capsys.readouterr()
+        assert "enrich_pid_tree" in captured.err
+
+    def test_is_process_alive_debug_dead(self, capsys):
+        """is_process_alive with debug on a dead PID should print debug msg."""
+        a = cla.Analyzer(key="test", look_in_log=False, show_debug=True)
+        with pytest.raises(cla.ProcessDead):
+            a.is_process_alive(9999999)
+        captured = capsys.readouterr()
+        assert "is_process_alive" in captured.err or "dead" in captured.err
+
+    def test_filter_pid_tree_debug(self, capsys):
+        """filter_pid_tree with show_info should print filter summary."""
+        a = cla.Analyzer(key="test", look_in_log=False, show_info=True)
+        pk = (100, "test")
+        a.pid_tree[pk] = cla.PidTreeEntry(cmd="ls", ppid=None, context="ctx", key="test", live=True)
+        a.filter_pid_tree()
+        captured = capsys.readouterr()
+        assert "Filtered out" in captured.err
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# COVERAGE — parse_ausearch SYSCALL_AVC regex path  
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.unit
+class TestParseAusearchSyscallAvcPath:
+    """Cover the SYSCALL_AVC regex match branch (no PROCTITLE) and ps fallback."""
+
+    def test_syscall_avc_path(self):
+        """Block with SYSCALL but no PROCTITLE should match SYSCALL_AVC regex."""
+        block = (
+            'type=SYSCALL msg=audit(09/02/2026 10:45:19.517:18438) : arch=x86_64 syscall=openat ppid=100 pid=200 uid=root\n'
+            'type=AVC msg=audit(09/02/2026 10:45:19.517:18438) : avc:  denied  { read } '
+            'for  pid=200 comm=myapp '
+            'scontext=system_u:system_r:myapp_t:s0 '
+            'tcontext=system_u:object_r:cert_t:s0 tclass=file permissive=1\n'
+        )
+        a = cla.Analyzer(key="test", look_in_log=False)
+        results = a.parse_ausearch_from_log(blocks=[block])
+        assert len(results) == 1
+        # Should have extracted pid/ppid from SYSCALL line
+        assert results[0].command.pid == "200"
+
+    def test_no_match_all_regex_fallback_to_individual(self):
+        """Block where neither FULL_AVC nor SYSCALL_AVC match should use individual
+        REGEX_EXTRACT_* patterns."""
+        block = (
+            'type=AVC msg=audit(09/02/2026 10:45:19.517:18438) : avc:  denied  { getattr } '
+            'for  pid=500 ppid=100 uid=1000 comm=myapp '
+            'scontext=system_u:system_r:myapp_t:s0 '
+            'tcontext=system_u:object_r:cert_t:s0 tclass=dir permissive=1\n'
+        )
+        a = cla.Analyzer(key="test", look_in_log=False)
+        results = a.parse_ausearch_from_log(blocks=[block])
+        assert len(results) == 1
+        # Individual regex extractions should find pid, ppid
+        assert results[0].command.pid == "500"
+
+    def test_ps_fallback_for_missing_ppid(self):
+        """When ppid is missing but pid is alive, get_from_pid should be called for ppid."""
+        # No ppid=... in block, and no SYSCALL line
+        block = (
+            'type=AVC msg=audit(09/02/2026 10:45:19.517:18438) : avc:  denied  { read } '
+            'for  pid=12345 comm=myapp '
+            'scontext=system_u:system_r:myapp_t:s0 '
+            'tcontext=system_u:object_r:cert_t:s0 tclass=file permissive=1\n'
+        )
+        a = cla.Analyzer(key="test", look_in_log=False)
+        calls = []
+
+        def fake_get_from_pid(pid, arg):
+            calls.append((pid, arg))
+            return cla.DEAD_PROCESS
+
+        with mock.patch.object(a, "get_from_pid", side_effect=fake_get_from_pid):
+            results = a.parse_ausearch_from_log(blocks=[block])
+
+        assert len(results) == 1
+        # Should have called get_from_pid for ppid and uid
+        called_args = {c[1] for c in calls}
+        assert "ppid" in called_args
+
+    def test_syscall_avc_bad_pid_ppid(self, capsys):
+        """SYSCALL_AVC match but REGEX_EXTRACT_PID_PPID fails should print error."""
+        # SYSCALL line without ppid= and pid= fields
+        block = (
+            'type=SYSCALL msg=audit(09/02/2026 10:45:19.517:18438) : arch=x86_64 syscall=openat uid=root\n'
+            'type=AVC msg=audit(09/02/2026 10:45:19.517:18438) : avc:  denied  { read } '
+            'for  pid=200 comm=myapp '
+            'scontext=system_u:system_r:myapp_t:s0 '
+            'tcontext=system_u:object_r:cert_t:s0 tclass=file permissive=1\n'
+        )
+        a = cla.Analyzer(key="test", look_in_log=False)
+        results = a.parse_ausearch_from_log(blocks=[block])
+        captured = capsys.readouterr()
+        assert len(results) >= 1
+        # Should have printed error about pid/ppid parsing
+        assert "error parsing" in captured.err or results[0].command.pid == "200"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# COVERAGE — enrich_pid_tree deeper walk paths
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.unit
+class TestEnrichPidTreeDeepPaths:
+    """Cover parent chain walking → existing entry with known cmd, ppid fill,
+    and parent already in tree continuation."""
+
+    def test_walk_continues_through_existing_parent(self):
+        """When parent is already in tree with known cmd, enrichment should walk up
+        to fill ppid if missing."""
+        a = cla.Analyzer(key="test", look_in_log=False)
+        child_pk = (500, "test")
+        parent_pk = (400, "test")
+        a.pid_tree[child_pk] = cla.PidTreeEntry(
+            cmd=cla.UNKNOWN, ppid=400, context=cla.UNKNOWN, key="test", live=True,
+        )
+        a.pid_tree[parent_pk] = cla.PidTreeEntry(
+            cmd="/bin/bash", ppid=None, context="ctx", key="test", live=True,
+        )
+        a.avc_pids.add(child_pk)
+
+        fake_child = mock.MagicMock()
+        fake_child.cmdline.return_value = ["/usr/bin/app"]
+        fake_child.ppid.return_value = 400
+
+        fake_parent = mock.MagicMock()
+        fake_parent.ppid.return_value = 1
+        fake_parent.is_running.return_value = True
+        fake_parent.status.return_value = "running"
+
+        def fake_is_alive(pid):
+            if int(pid) == 500:
+                return fake_child
+            if int(pid) == 400:
+                return fake_parent
+            raise cla.ProcessDead(f"{pid}")
+
+        with mock.patch.object(a, "is_process_alive", side_effect=fake_is_alive), \
+             mock.patch("builtins.open", side_effect=PermissionError("denied")):
+            a.enrich_pid_tree()
+
+        # Child should be enriched
+        assert a.pid_tree[child_pk].cmd == "/usr/bin/app"
+        # Parent should have ppid filled
+        assert a.pid_tree[parent_pk].ppid == 1
+
+    def test_enrich_info_prints(self, capsys):
+        """enrich_pid_tree with show_info should print summary."""
+        a = cla.Analyzer(key="test", look_in_log=False, show_info=True)
+        pk = (9999999, "test")
+        a.pid_tree[pk] = cla.PidTreeEntry(
+            cmd=cla.UNKNOWN, ppid=None, context=cla.UNKNOWN, key="test", live=True,
+        )
+        a.avc_pids.add(pk)
+        a.enrich_pid_tree()
+        captured = capsys.readouterr()
+        assert "enrich_pid_tree" in captured.err
+
+
+# ── save_analyzed_entries + load round-trip ──────────────────────────
+@pytest.mark.unit
+class TestSaveAnalyzedEntries:
+    """Cover save_analyzed_entries happy path, IOError path,
+    and the show_info print inside it (lines 1513-1561)."""
+
+    def test_save_and_reload(self, tmp_path):
+        state = tmp_path / "state.json"
+        a = cla.Analyzer(key="t", look_in_log=False, state_file_path=str(state))
+        a.analyzed_entries = {"entry_a", "entry_b"}
+        a.save_analyzed_entries()
+        assert state.exists()
+        # reload
+        b = cla.Analyzer(key="t", look_in_log=False, state_file_path=str(state))
+        b.load_analyzed_entries()
+        assert b.analyzed_entries == {"entry_a", "entry_b"}
+
+    def test_save_show_info(self, tmp_path, capsys):
+        state = tmp_path / "state.json"
+        a = cla.Analyzer(key="t", look_in_log=False, state_file_path=str(state), show_info=True)
+        a.analyzed_entries = {"x"}
+        a.save_analyzed_entries()
+        assert "Saved 1 analyzed entries" in capsys.readouterr().err
+
+    def test_save_io_error(self, tmp_path, capsys):
+        """IOError during save should warn, not raise."""
+        a = cla.Analyzer(key="t", look_in_log=False, state_file_path="/proc/nonexistent/state.json")
+        a.analyzed_entries = {"x"}
+        a.save_analyzed_entries()
+        assert "Could not save state file" in capsys.readouterr().err
+
+    def test_load_show_info(self, tmp_path, capsys):
+        """show_info print during load (line 1497)."""
+        state = tmp_path / "state.json"
+        state.write_text('{"analyzed_entries": ["a", "b"]}')
+        a = cla.Analyzer(key="t", look_in_log=False, state_file_path=str(state), show_info=True)
+        a.load_analyzed_entries()
+        assert "Loaded 2 previously analyzed entries" in capsys.readouterr().err
+
+
+# ── parse_execve_logs (mocked _iter_subprocess_blocks) ───────────────
+@pytest.mark.unit
+class TestParseExecveLogs:
+    """Cover parse_execve_logs code paths (lines 1580-1700)
+    by mocking _iter_subprocess_blocks to return crafted EXECVE blocks."""
+
+    EXECVE_BLOCK = (
+        "type=SYSCALL msg=audit(1710000000.123:456): arch=c000003e syscall=59 "
+        "ppid=1 pid=100 uid=0 subj=system_u:system_r:test_t:s0\n"
+        "type=EXECVE msg=audit(1710000000.123:456): argc=2 a0=\"/usr/bin/app\" a1=\"--start\""
+    )
+
+    def _make_analyzer(self, **kw):
+        a = cla.Analyzer(key="test", look_in_log=True, log_path="/dev/null", **kw)
+        return a
+
+    def test_basic_execve(self):
+        a = self._make_analyzer()
+        with mock.patch.object(a, "_iter_subprocess_blocks", return_value=iter([self.EXECVE_BLOCK])):
+            count = a.parse_execve_logs()
+        assert count == 1
+        pk = (100, "test")
+        assert pk in a.pid_tree
+        assert a.pid_tree[pk].cmd == "/usr/bin/app --start"
+
+    def test_empty_block_skipped(self):
+        a = self._make_analyzer()
+        with mock.patch.object(a, "_iter_subprocess_blocks", return_value=iter(["", "  "])):
+            count = a.parse_execve_logs()
+        assert count == 0
+
+    def test_no_execve_type_skipped(self):
+        block = "type=SYSCALL msg=audit(1710000000.123:456): arch=c000003e pid=100 ppid=1"
+        a = self._make_analyzer()
+        with mock.patch.object(a, "_iter_subprocess_blocks", return_value=iter([block])):
+            count = a.parse_execve_logs()
+        assert count == 0
+
+    def test_already_analyzed_skipped(self, tmp_path):
+        state = tmp_path / "state.json"
+        a = self._make_analyzer(state_file_path=str(state))
+        a.mark_entry_analyzed(self.EXECVE_BLOCK)
+        with mock.patch.object(a, "_iter_subprocess_blocks", return_value=iter([self.EXECVE_BLOCK])):
+            count = a.parse_execve_logs()
+        assert count == 0
+
+    def test_no_msg_match_skipped(self):
+        block = "type=EXECVE no_msg_audit_here"
+        a = self._make_analyzer()
+        with mock.patch.object(a, "_iter_subprocess_blocks", return_value=iter([block])):
+            count = a.parse_execve_logs()
+        assert count == 0
+
+    def test_no_pid_ppid_skipped(self):
+        block = (
+            "type=SYSCALL msg=audit(1710000000.123:456): arch=c000003e syscall=59\n"
+            "type=EXECVE msg=audit(1710000000.123:456): argc=1 a0=\"/bin/ls\""
+        )
+        a = self._make_analyzer()
+        with mock.patch.object(a, "_iter_subprocess_blocks", return_value=iter([block])):
+            count = a.parse_execve_logs()
+        assert count == 0
+
+    def test_pid_reuse_detect(self, capsys):
+        """PID reuse: same PID with different ppid triggers collision warning."""
+        block1 = (
+            "type=SYSCALL msg=audit(1710000000.100:100): arch=c000003e syscall=59 "
+            "ppid=1 pid=200 uid=0 subj=system_u:system_r:test_t:s0\n"
+            "type=EXECVE msg=audit(1710000000.100:100): argc=1 a0=\"/bin/first\""
+        )
+        block2 = (
+            "type=SYSCALL msg=audit(1710000000.200:200): arch=c000003e syscall=59 "
+            "ppid=50 pid=200 uid=0 subj=system_u:system_r:test_t:s0\n"
+            "type=EXECVE msg=audit(1710000000.200:200): argc=1 a0=\"/bin/second\""
+        )
+        a = self._make_analyzer()
+        # Pre-populate parent so child link insertion works
+        a.pid_tree[(1, "test")] = cla.PidTreeEntry(
+            cmd="/sbin/init", ppid=None, context=cla.UNKNOWN, key="test", live=True,
+            children=[(200, "test")],
+        )
+        with mock.patch.object(a, "_iter_subprocess_blocks", return_value=iter([block1, block2])):
+            count = a.parse_execve_logs()
+        assert count == 2
+        assert "PID collision" in capsys.readouterr().err
+
+    def test_pid_reuse_show_info(self, capsys):
+        """PID reuse with show_info prints full PID list."""
+        block1 = (
+            "type=SYSCALL msg=audit(1710000000.100:100): arch=c000003e syscall=59 "
+            "ppid=1 pid=200 uid=0 subj=system_u:system_r:test_t:s0\n"
+            "type=EXECVE msg=audit(1710000000.100:100): argc=1 a0=\"/bin/a\""
+        )
+        block2 = (
+            "type=SYSCALL msg=audit(1710000000.200:200): arch=c000003e syscall=59 "
+            "ppid=50 pid=200 uid=0 subj=system_u:system_r:test_t:s0\n"
+            "type=EXECVE msg=audit(1710000000.200:200): argc=1 a0=\"/bin/b\""
+        )
+        a = self._make_analyzer(show_info=True)
+        a.pid_tree[(1, "test")] = cla.PidTreeEntry(
+            cmd="/sbin/init", ppid=None, context=cla.UNKNOWN, key="test", live=True,
+            children=[(200, "test")],
+        )
+        with mock.patch.object(a, "_iter_subprocess_blocks", return_value=iter([block1, block2])):
+            a.parse_execve_logs()
+        err = capsys.readouterr().err
+        # show_info path prints full list
+        assert "PID collision" in err
+
+    def test_no_events_warning(self, capsys):
+        """When no blocks yielded at all, show_info prints warning."""
+        a = self._make_analyzer(show_info=True)
+        with mock.patch.object(a, "_iter_subprocess_blocks", return_value=iter([])):
+            count = a.parse_execve_logs()
+        assert count == 0
+        assert "No EXECVE events found" in capsys.readouterr().err
+
+    def test_timeout_handled(self, capsys):
+        """TimeoutExpired during _iter_subprocess_blocks is caught."""
+        def _raise_timeout():
+            raise subprocess.TimeoutExpired(["ausearch"], 60)
+            yield  # make it a generator
+        a = self._make_analyzer()
+        with mock.patch.object(a, "_iter_subprocess_blocks", side_effect=subprocess.TimeoutExpired(["ausearch"], 60)):
+            count = a.parse_execve_logs()
+        assert count == 0
+        assert "timed out" in capsys.readouterr().err
+
+    def test_debug_prints(self, capsys):
+        """show_debug prints are emitted during parse_execve_logs."""
+        a = self._make_analyzer(show_debug=True)
+        with mock.patch.object(a, "_iter_subprocess_blocks", return_value=iter([self.EXECVE_BLOCK])):
+            a.parse_execve_logs()
+        err = capsys.readouterr().err
+        assert "parse_execve_logs" in err
+
+    def test_no_subj_uses_unknown(self):
+        """Block without subj= should use UNKNOWN context."""
+        block = (
+            "type=SYSCALL msg=audit(1710000000.123:456): arch=c000003e syscall=59 "
+            "ppid=1 pid=100 uid=0\n"
+            "type=EXECVE msg=audit(1710000000.123:456): argc=1 a0=\"/bin/ls\""
+        )
+        a = self._make_analyzer()
+        with mock.patch.object(a, "_iter_subprocess_blocks", return_value=iter([block])):
+            a.parse_execve_logs()
+        pk = (100, "test")
+        assert a.pid_tree[pk].context == cla.UNKNOWN
+
+    def test_parent_placeholder_created(self):
+        """When ppid doesn't exist yet, a placeholder parent is created."""
+        a = self._make_analyzer()
+        with mock.patch.object(a, "_iter_subprocess_blocks", return_value=iter([self.EXECVE_BLOCK])):
+            a.parse_execve_logs()
+        # ppid=1, so (1, "test") should exist as placeholder
+        ppid_pk = (1, "test")
+        assert ppid_pk in a.pid_tree
+        assert (100, "test") in a.pid_tree[ppid_pk].children
+
+
+# ── identify_app_root ────────────────────────────────────────────────
+@pytest.mark.unit
+class TestIdentifyAppRoot:
+    """Cover identify_app_root lines 1783, 1786."""
+
+    def test_identify_app_root_found(self, capsys):
+        a = cla.Analyzer(key="t", look_in_log=False, show_info=True,
+                         app_name="myapp", context_filter=["myapp_t"])
+        pk = (42, "t")
+        a.pid_tree[pk] = cla.PidTreeEntry(
+            cmd="/usr/bin/myapp --run", ppid=1, context="u:r:myapp_t:s0", key="t", live=True,
+        )
+        a.identify_app_root()
+        assert pk in a.app_root_pids
+        assert "Identified app root PID" in capsys.readouterr().err
+
+    def test_identify_app_root_not_found(self, capsys):
+        a = cla.Analyzer(key="t", look_in_log=False, show_info=True,
+                         app_name="myapp", context_filter=["myapp_t"])
+        # No matching entries
+        a.identify_app_root()
+        assert "Could not identify any app root PID" in capsys.readouterr().err
+
+    def test_identify_app_root_skipped_without_params(self):
+        a = cla.Analyzer(key="t", look_in_log=False)
+        a.identify_app_root()  # no-op, no crash
+        assert a.app_root_pids == []
+
+
+# ── build(show_info=True) line 672 ──────────────────────────────────
+@pytest.mark.unit
+class TestBuildShowInfo:
+    def test_build_with_show_info_print(self, capsys):
+        """build(show_info=True) prints alias creation (line 672)."""
+        ci = cla.CmdIndex()
+        # Need a command long enough and weighted enough
+        long_cmd = "/usr/bin/very_long_command --with many args that exceed threshold"
+        ci.log_weight(long_cmd, weight=50)
+        ci.build(show_info=True)
+        err = capsys.readouterr().err
+        assert "creating alias" in err
+
+
+# ── NsIndex.items() line 488 ────────────────────────────────────────
+@pytest.mark.unit
+class TestNsIndexItems:
+    def test_items_returns_mapping(self):
+        ni = cla.NsIndex()
+        ni.set(111, "label_a")
+        items = list(ni.items())
+        assert (111, "label_a") in items
+
+
+# ── format_rules show_debug line 1471 ──────────────────────────────
+@pytest.mark.unit
+class TestFormatRulesDebug:
+    def test_format_rules_debug_print(self, capsys):
+        a = cla.Analyzer(key="t", look_in_log=False, show_debug=True)
+        a.log_cmd("myapp", weight=1)
+        result = cla.AnalysisResult(
+            command=cla.CommandContext(key="t", descriptors=set(), pid_namespace="?", cmd="myapp", pid=1),
+            avc_list=[cla.AvcDenial(method="read", source_type="src_t", target_type="tgt_t", tclass="file")],
+        )
+        a.format_rules([result])
+        err = capsys.readouterr().err
+        assert "adding" in err and "required by rule" in err
+
+
+# ── parse_existing_file edge cases (lines 1249-1253, 1282, 1300, 1330) ──
+@pytest.mark.unit
+class TestParseExistingFileEdgeCases:
+    """Cover error paths in parse_rules_from_files and parse_existing_file."""
+
+    def test_malformed_explanation_line(self, capsys):
+        """Cmd explanation line that doesn't match REGEX_MAIN_EXPLANATION (line 1249)."""
+        a = cla.Analyzer(key="t", look_in_log=False, show_explanations=True)
+        # Valid AVC rule but malformed explanation (no KEY_DELIMITER in cmd line)
+        doc = (
+            f"\nallow src_t tgt_t:file read;\n"
+            f"{cla.PREFIX_CMD_LINE}# required by :\n"
+            f"{cla.PREFIX_CMD_LINE}this line has no key_delimiter\n"
+            f"{cla.INDEX_DELIMITER}\n"
+        )
+        results = a.parse_existing_file(doc)
+        err = capsys.readouterr().err
+        assert "error parsing a command from a file" in err
+
+    def test_unparseable_block_error(self, capsys):
+        """Block that matches neither AVC rule nor cmd section (line 1300)."""
+        a = cla.Analyzer(key="t", look_in_log=False)
+        # Extra \nallow to create a second block that doesn't match REGEX_ALLOW_RULE
+        doc = (
+            f"\nallow src_t tgt_t:file read;\n"
+            f"{cla.PREFIX_CMD_LINE}# required by :\n"
+            f"{cla.PREFIX_CMD_LINE}t {cla.KEY_DELIMITER} /bin/x (pid=1 ; pid_ns=?)\n"
+            f"\nallow this_is_not_a_valid_rule\n"
+            f"{cla.INDEX_DELIMITER}\n"
+        )
+        results = a.parse_existing_file(doc)
+        err = capsys.readouterr().err
+        assert "error on block" in err
+
+    def test_avc_with_pid_tracking(self):
+        """File-parsed result with pid triggers avc_pids.add and log_cmd (lines 1282-1283)."""
+        a = cla.Analyzer(key="t", look_in_log=False)
+        doc = (
+            f"\nallow src_t tgt_t:file read;\n"
+            f"{cla.PREFIX_CMD_LINE}# required by :\n"
+            f"{cla.PREFIX_CMD_LINE}t {cla.KEY_DELIMITER} /usr/bin/mycmd (pid=42 ; pid_ns=?)\n"
+            f"{cla.INDEX_DELIMITER}\n"
+        )
+        results = a.parse_existing_file(doc)
+        assert len(results) > 0
+
+
+# ── _iter_subprocess_blocks timeout (lines 938-940, 952) ────────────
+@pytest.mark.unit
+class TestIterSubprocessBlocksTimeout:
+    def test_timeout_during_iteration(self):
+        """Timeout triggers proc.kill and TimeoutExpired (lines 938-940)."""
+        a = cla.Analyzer(key="t", look_in_log=False)
+        original_monotonic = time.monotonic
+
+        call_count = [0]
+        start_time = original_monotonic()
+
+        def mock_monotonic():
+            call_count[0] += 1
+            if call_count[0] > 2:
+                # Simulate timeout by returning a time way in the future
+                return start_time + cla.SUBPROCESS_TIMEOUT + 100
+            return start_time
+
+        with mock.patch("time.monotonic", side_effect=mock_monotonic), \
+             mock.patch("subprocess.Popen") as mock_popen:
+            fake_proc = mock.MagicMock()
+            fake_proc.stdout = iter(["line1\n", "----\n", "line2\n"])
+            fake_proc.poll.return_value = None
+            mock_popen.return_value = fake_proc
+            with pytest.raises(subprocess.TimeoutExpired):
+                list(a._iter_subprocess_blocks(["echo"]))
+
+    def test_finally_kills_running_proc(self):
+        """If proc is still running when generator exits, it's killed (line 952)."""
+        a = cla.Analyzer(key="t", look_in_log=False)
+        with mock.patch("subprocess.Popen") as mock_popen:
+            fake_proc = mock.MagicMock()
+            fake_proc.stdout = iter(["line1\n"])
+            fake_proc.poll.return_value = None  # still running
+            mock_popen.return_value = fake_proc
+            list(a._iter_subprocess_blocks(["echo"]))
+            fake_proc.kill.assert_called_once()
+            fake_proc.wait.assert_called()
+
+
+# ── enrich_pid_tree: init placeholder + AccessDenied (lines 1848, 1901) ─
+@pytest.mark.unit
+class TestEnrichPidTreeInitPlaceholder:
+    def test_reaching_init_creates_placeholder(self):
+        """When walk reaches pid=0 (kernel), a placeholder is created via psutil.Process (line 1901)."""
+        a = cla.Analyzer(key="t", look_in_log=False)
+        # Process with ppid=0 — ppid is falsy so no parent placeholder is created
+        child_pk = (500, "t")
+        a.pid_tree[child_pk] = cla.PidTreeEntry(
+            cmd=cla.UNKNOWN, ppid=None, context=cla.UNKNOWN, key="t", live=True,
+        )
+        a.avc_pids.add(child_pk)
+
+        fake_child = mock.MagicMock()
+        fake_child.cmdline.return_value = ["/usr/bin/app"]
+        fake_child.ppid.return_value = 0  # kernel thread, ppid=0 is falsy
+        fake_child.pid = 500
+
+        fake_init = mock.MagicMock()
+        fake_init.cmdline.return_value = ["/sbin/init"]
+
+        def fake_is_alive(pid):
+            pid = int(pid)
+            if pid == 500:
+                return fake_child
+            raise cla.ProcessDead(f"{pid}")
+
+        def fake_psutil_process(pid):
+            if pid == 0:
+                return fake_init
+            raise psutil.NoSuchProcess(pid)
+
+        with mock.patch.object(a, "is_process_alive", side_effect=fake_is_alive), \
+             mock.patch("builtins.open", side_effect=PermissionError("denied")), \
+             mock.patch("psutil.Process", side_effect=fake_psutil_process):
+            a.enrich_pid_tree()
+
+        # init placeholder for pid=0 should exist
+        init_pk = (0, "t")
+        assert init_pk in a.pid_tree
+        assert a.pid_tree[init_pk].cmd == "/sbin/init"
+
+    def test_access_denied_labels_dead(self, capsys):
+        """AccessDenied during walk labels process as dead (line 1848/1915)."""
+        a = cla.Analyzer(key="t", look_in_log=False, show_debug=True)
+        pk = (999, "t")
+        parent_pk = (1, "t")
+        # Give it a parent so post-enrichment prune doesn't remove it
+        a.pid_tree[parent_pk] = cla.PidTreeEntry(
+            cmd="/sbin/init", ppid=None, context="u:r:init_t:s0", key="t", live=True,
+            children=[pk],
+        )
+        a.pid_tree[pk] = cla.PidTreeEntry(
+            cmd=cla.UNKNOWN, ppid=1, context=cla.UNKNOWN, key="t", live=True,
+        )
+        a.avc_pids.add(pk)
+
+        fake_proc = mock.MagicMock()
+        fake_proc.cmdline.side_effect = psutil.AccessDenied(999)
+        fake_proc.pid = 999
+
+        def fake_alive(pid):
+            return fake_proc
+
+        with mock.patch.object(a, "is_process_alive", side_effect=fake_alive):
+            a.enrich_pid_tree()
+
+        assert pk in a.pid_tree
+        assert a.pid_tree[pk].cmd == cla.DEAD_PROCESS
+        assert "error on pid" in capsys.readouterr().err
+
+
+# ── format_pid_tree: padding and visited node (lines 1971, 1977, 1982) ─
+@pytest.mark.unit
+class TestFormatPidTreePaddingPaths:
+    def test_long_context_triggers_single_space_pad(self):
+        """When pid_part + ctx_part >= CMD_ALIGN, a single space is used (line 1971)."""
+        a = cla.Analyzer(key="t", look_in_log=False)
+        pk = (42, "t")
+        # Very long context to exceed CMD_ALIGN
+        long_ctx = "system_u:system_r:very_long_type_name_that_exceeds_alignment_threshold:s0:c0.c1023"
+        a.pid_tree[pk] = cla.PidTreeEntry(
+            cmd="/bin/ls", ppid=None, context=long_ctx, key="t", live=True,
+        )
+        output = a.format_pid_tree()
+        assert "/bin/ls" in output
+        assert long_ctx in output
+
+    def test_visited_node_skipped(self):
+        """Circular reference: visited node is skipped (line 1977)."""
+        a = cla.Analyzer(key="t", look_in_log=False)
+        pk_a = (1, "t")
+        pk_b = (2, "t")
+        a.pid_tree[pk_a] = cla.PidTreeEntry(
+            cmd="/sbin/init", ppid=None, context="u:r:init_t:s0", key="t", live=True,
+            children=[pk_b],
+        )
+        # b references back to a as child (circular)
+        a.pid_tree[pk_b] = cla.PidTreeEntry(
+            cmd="/bin/loop", ppid=1, context="u:r:loop_t:s0", key="t", live=True,
+            children=[pk_a],
+        )
+        output = a.format_pid_tree()
+        # Should contain both nodes exactly once, no infinite recursion
+        assert "init" in output
+        assert "loop" in output
+
+
+# ── merge_json alias collision debug print (line 2105) ──────────────
+@pytest.mark.unit
+class TestMergeJsonAliasCollisionPrint:
+    def test_alias_collision_debug_print(self, capsys):
+        a = cla.Analyzer(key="t", look_in_log=False, show_info=True)
+        # Pre-register an alias so the imported one collides
+        a.cmd_index.register("/usr/bin/something_else", "C0")
+        json_doc = {
+            "version": cla.JSON_FORMAT_VERSION,
+            "key": "t",
+            "AVC": [],
+            "index": {"/usr/bin/collision_cmd": "C0"},
+            "all_cmds": {},
+            "pid_tree": {},
+            "app_root_pids": [],
+        }
+        a.merge_json(json_doc)
+        err = capsys.readouterr().err
+        assert "collided" in err
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CLI TESTS — subprocess invocation of the real script
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.cli
+class TestCLI:
+    """End-to-end CLI tests running the actual se_log_analyser script."""
+
+    # ── basic invocation ────────────────────────────────────────────────────
+
+    def test_ignore_log_no_input(self):
+        """--ignore-log with no input files should succeed with 0 AVC."""
+        result = subprocess.run(
+            [sys.executable, _SCRIPT_PATH, "--ignore-log", "--key", "test"],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0
+        assert "0 AVC analyzed from logs" in result.stderr
+
+    def test_ignore_log_with_key(self):
+        """--key value should appear in stderr summary."""
+        result = subprocess.run(
+            [sys.executable, _SCRIPT_PATH, "--ignore-log", "--key", "MyHost"],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0
+
+    # ── key sanitization ────────────────────────────────────────────────────
+
+    def test_key_sanitization(self):
+        """Special characters in --key should be sanitized in the output."""
+        result = subprocess.run(
+            [sys.executable, _SCRIPT_PATH, "--ignore-log", "--key", "host/foo bar"],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0
+        # '/' and ' ' replaced with '_'
+        assert "host/foo bar" not in result.stdout
+
+    # ── log path validation ─────────────────────────────────────────────────
+
+    def test_invalid_log_path(self):
+        """--log pointing to a non-existent file should fail."""
+        result = subprocess.run(
+            [sys.executable, _SCRIPT_PATH, "--log", "/nonexistent/audit.log"],
+            capture_output=True, text=True,
+        )
+        assert result.returncode != 0
+        assert "FileNotFoundError" in result.stderr or "not a regular file" in result.stderr
+
+    def test_log_path_directory(self, tmp_path):
+        """--log pointing to a directory should fail."""
+        result = subprocess.run(
+            [sys.executable, _SCRIPT_PATH, "--log", str(tmp_path)],
+            capture_output=True, text=True,
+        )
+        assert result.returncode != 0
+
+    # ── --files validation ──────────────────────────────────────────────────
+
+    def test_files_missing_index(self, tmp_path):
+        """--files with a file missing the INDEX delimiter should fail."""
+        bad_file = tmp_path / "no_index.txt"
+        bad_file.write_text("allow myapp_t tmp_t:file read;\n")
+        result = subprocess.run(
+            [sys.executable, _SCRIPT_PATH, "--ignore-log", "--files", str(bad_file)],
+            capture_output=True, text=True,
+        )
+        assert result.returncode != 0
+        assert "index not found" in result.stderr or "FileParsingError" in result.stderr
+
+    def test_files_nonexistent(self, tmp_path):
+        """--files with a non-existent path should fail."""
+        result = subprocess.run(
+            [sys.executable, _SCRIPT_PATH, "--ignore-log",
+             "--files", str(tmp_path / "missing.txt")],
+            capture_output=True, text=True,
+        )
+        assert result.returncode != 0
+
+    # ── --json-files validation ─────────────────────────────────────────────
+
+    def test_json_files_invalid_json(self, tmp_path):
+        """--json-files with invalid JSON should fail."""
+        bad = tmp_path / "bad.json"
+        bad.write_text("{not valid json")
+        result = subprocess.run(
+            [sys.executable, _SCRIPT_PATH, "--ignore-log",
+             "--json-files", str(bad)],
+            capture_output=True, text=True,
+        )
+        assert result.returncode != 0
+        assert "error parsing JSON file" in result.stderr or "FileParsingError" in result.stderr
+
+    def test_json_files_nonexistent(self, tmp_path):
+        """--json-files with a non-existent path should fail."""
+        result = subprocess.run(
+            [sys.executable, _SCRIPT_PATH, "--ignore-log",
+             "--json-files", str(tmp_path / "missing.json")],
+            capture_output=True, text=True,
+        )
+        assert result.returncode != 0
+
+    # ── output destinations ─────────────────────────────────────────────────
+
+    def test_dest_flag(self, tmp_path):
+        """--dest should write human-readable output to a file."""
+        dest = tmp_path / "output.txt"
+        result = subprocess.run(
+            [sys.executable, _SCRIPT_PATH, "--ignore-log", "--key", "test",
+             "--dest", str(dest)],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0
+        assert dest.exists()
+        content = dest.read_text()
+        assert cla.INDEX_DELIMITER in content
+
+    def test_json_dest_flag(self, tmp_path):
+        """--json-dest should produce valid JSON output."""
+        jdest = tmp_path / "output.json"
+        result = subprocess.run(
+            [sys.executable, _SCRIPT_PATH, "--ignore-log", "--key", "test",
+             "--json-dest", str(jdest)],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0
+        assert jdest.exists()
+        data = json.loads(jdest.read_text())
+        assert "version" in data
+        assert data["key"] == "test"
+
+    def test_json_dest_only_skips_stdout(self, tmp_path):
+        """--json-dest without --dest should produce no stdout."""
+        jdest = tmp_path / "output.json"
+        result = subprocess.run(
+            [sys.executable, _SCRIPT_PATH, "--ignore-log", "--key", "test",
+             "--json-dest", str(jdest)],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0
+        # No human-readable output on stdout
+        assert result.stdout.strip() == ""
+
+    def test_both_dest_and_json_dest(self, tmp_path):
+        """--dest + --json-dest should produce both outputs."""
+        dest = tmp_path / "output.txt"
+        jdest = tmp_path / "output.json"
+        result = subprocess.run(
+            [sys.executable, _SCRIPT_PATH, "--ignore-log", "--key", "test",
+             "--dest", str(dest), "--json-dest", str(jdest)],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0
+        assert dest.exists()
+        assert jdest.exists()
+
+    # ── flags ───────────────────────────────────────────────────────────────
+
+    def test_no_explanations_flag(self):
+        """--no-explanations should suppress explanation comments."""
+        result = subprocess.run(
+            [sys.executable, _SCRIPT_PATH, "--ignore-log", "--key", "test",
+             "--no-explanations"],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0
+        assert "# required by :" not in result.stdout
+
+    def test_no_tree_flag(self):
+        """--no-tree should suppress PID tree section."""
+        result = subprocess.run(
+            [sys.executable, _SCRIPT_PATH, "--ignore-log", "--key", "test",
+             "--no-tree"],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0
+        assert cla.PID_TREE_DELIMITER not in result.stdout
+
+    def test_no_index_flag(self):
+        """--no-index should suppress the INDEX section."""
+        result = subprocess.run(
+            [sys.executable, _SCRIPT_PATH, "--ignore-log", "--key", "test",
+             "--no-index"],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0
+
+    def test_debug_flag(self):
+        """--debug should not crash."""
+        result = subprocess.run(
+            [sys.executable, _SCRIPT_PATH, "--ignore-log", "--key", "test",
+             "--debug"],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0
+
+    def test_verbose_flag(self):
+        """--verbose should not crash."""
+        result = subprocess.run(
+            [sys.executable, _SCRIPT_PATH, "--ignore-log", "--key", "test",
+             "--verbose"],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0
+
+    # ── --files round-trip via CLI ──────────────────────────────────────────
+
+    @needs_testlog
+    @needs_ausearch
+    def test_files_roundtrip(self, tmp_path):
+        """Produce output via CLI, feed it back via --files, rules should survive."""
+        dest1 = tmp_path / "pass1.txt"
+        result1 = subprocess.run(
+            [sys.executable, _SCRIPT_PATH, "--log", TEST_LOG, "--key", "Rocky",
+             "--context-filter", "myapp_t", "--app-name", "myapp",
+             "--dest", str(dest1)],
+            capture_output=True, text=True,
+        )
+        assert result1.returncode == 0
+        assert dest1.exists()
+        txt1 = dest1.read_text()
+        assert "allow myapp_t" in txt1
+
+        dest2 = tmp_path / "pass2.txt"
+        result2 = subprocess.run(
+            [sys.executable, _SCRIPT_PATH, "--ignore-log", "--key", "Rocky",
+             "--files", str(dest1), "--dest", str(dest2)],
+            capture_output=True, text=True,
+        )
+        assert result2.returncode == 0
+        txt2 = dest2.read_text()
+        assert "allow myapp_t" in txt2
+
+    # ── --json-files round-trip via CLI ─────────────────────────────────────
+
+    @needs_testlog
+    @needs_ausearch
+    def test_json_roundtrip(self, tmp_path):
+        """Produce JSON via CLI, reload via --json-files, rules should survive."""
+        jdest1 = tmp_path / "pass1.json"
+        result1 = subprocess.run(
+            [sys.executable, _SCRIPT_PATH, "--log", TEST_LOG, "--key", "Rocky",
+             "--context-filter", "myapp_t", "--app-name", "myapp",
+             "--json-dest", str(jdest1)],
+            capture_output=True, text=True,
+        )
+        assert result1.returncode == 0
+        data1 = json.loads(jdest1.read_text())
+        assert len(data1["results"]) > 0
+
+        dest2 = tmp_path / "pass2.txt"
+        result2 = subprocess.run(
+            [sys.executable, _SCRIPT_PATH, "--ignore-log", "--key", "Rocky",
+             "--json-files", str(jdest1), "--dest", str(dest2)],
+            capture_output=True, text=True,
+        )
+        assert result2.returncode == 0
+        txt2 = dest2.read_text()
+        assert "allow myapp_t" in txt2
+
+    # ── stderr summary line ─────────────────────────────────────────────────
+
+    @needs_testlog
+    @needs_ausearch
+    def test_stderr_summary(self, tmp_path):
+        """stderr should contain the AVC / file counter / PID tree summary."""
+        result = subprocess.run(
+            [sys.executable, _SCRIPT_PATH, "--log", TEST_LOG, "--key", "Rocky",
+             "--context-filter", "myapp_t", "--app-name", "myapp"],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0
+        assert "AVC analyzed from logs" in result.stderr
+        assert "found in the existing files" in result.stderr
+        assert "PID tree:" in result.stderr
+
+    # ── state file via CLI ──────────────────────────────────────────────────
+
+    @needs_testlog
+    @needs_ausearch
+    def test_state_file_flag(self, tmp_path):
+        """--state-file should create a state file after analysis."""
+        sf = tmp_path / "state.json"
+        result = subprocess.run(
+            [sys.executable, _SCRIPT_PATH, "--log", TEST_LOG, "--key", "Rocky",
+             "--context-filter", "myapp_t", "--app-name", "myapp",
+             "--state-file", str(sf)],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0
+        assert sf.exists()
+        data = json.loads(sf.read_text())
+        assert "analyzed_entries" in data

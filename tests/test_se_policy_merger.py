@@ -24,9 +24,6 @@ Test categories
   Edge / Error   - empty input, comments only, malformed lines
 """
 
-import importlib
-import importlib.machinery
-import importlib.util
 import os
 import re
 import subprocess
@@ -36,14 +33,9 @@ import textwrap
 
 import pytest  # pyright: ignore[reportMissingImports]
 
-# ── import se_policy_merger as a module ─────────────────────────────────────
-_SCRIPT_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "se_policy_merger")
-_loader = importlib.machinery.SourceFileLoader("se_policy_merger", _SCRIPT_PATH)
-_spec = importlib.util.spec_from_loader("se_policy_merger", _loader,
-                                         origin=_SCRIPT_PATH)
-spm = importlib.util.module_from_spec(_spec)
-sys.modules["se_policy_merger"] = spm
-_spec.loader.exec_module(spm)
+from conftest import se_policy_merger as spm, _PROJECT_ROOT
+
+_SCRIPT_PATH = os.path.join(_PROJECT_ROOT, "se_policy_merger")
 
 
 # ── helper ──────────────────────────────────────────────────────────────────
@@ -1442,3 +1434,4 @@ class TestCLI:
             capture_output=True, text=True,
         )
         assert result.returncode != 0
+        assert "No such file" in result.stderr or "FileNotFoundError" in result.stderr
