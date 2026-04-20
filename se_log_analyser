@@ -240,12 +240,14 @@ def get_base_cmd(cmd):
     base = os.path.basename(cmd[0])
     i = 1
     n = len(cmd)
-    while base in emulators and i < n:
+    #ignore emulators and options before the actual command (eg. python -sP seinfo -> seinfo)
+    while (base in emulators or base.startswith("-")) and i < n:
         base = os.path.basename(cmd[i])
         i += 1
-    if base.startswith("-") and i - 2 >= 0:
-        # take the base before the first argument
-        base = os.path.basename(cmd[i - 2])
+    #if the atual command is an emulator (eg. python --version), we get it back
+    while i>0 and base.startswith("-"):
+        i -= 1
+        base = os.path.basename(cmd[i])
     return base.upper()
 
 
