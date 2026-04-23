@@ -39,7 +39,7 @@
 ## aureport
 ## ausearch
 ## audit2allow
-## auditctl -a always,exit -S execve
+## auditctl -a always,exit -S execve -S execveat -S fork -S vfork -S clone
 ######
 
 ######
@@ -47,7 +47,7 @@
 ## It returns a text containing :
 ##     - All the SELinux rules that are needed (ie what audit2allow do normally)
 ##     - The commands that caused each rules and some useful info about them
-##     - A PID Tree section showing process hierarchy from EXECVE syscalls (with PID, command, SELinux context)
+##     - A PID Tree section showing process hierarchy from process-creation syscalls (with PID, command, SELinux context)
 ## The output can be given to my 'se_policy_merger' tool to pack it into a policy.
 ## As of now, this script only understand "allow_rules", which mean a few AVC/USER_AVC error won't be resolved with it (for example an invalid context or constraint violation)
 ##   Don't forget to use audit2allow which is a more advanced analyzer if this happen.
@@ -141,10 +141,14 @@ INDEX_MIN_LEN = 100  # minimal length of a command (with its args) to index it
 INDEX_MIN_ARG = 1  # minimal number of arguments to be indexed
 # - this condition is necessary
 
-emulators = ["python3", "python", "tclsh", "bash", "sh"]
+emulators = ["python3", "python", "tclsh", "bash", "sh", "coreutils"]
 DEFAULT_LOG_PATH = "/var/log/audit/audit.log"
 SUBPROCESS_TIMEOUT = 300  # seconds — max wall-clock time for ausearch/aureport/audit2allow
 JSON_FORMAT_VERSION = 3   # version tag for --json-dest / --json-files round-trip format
+
+# Syscall families for PID tree building
+FORK_SYSCALLS = {"fork", "vfork", "clone"}
+PID_TREE_SYSCALLS = ["execve", "execveat", "fork", "vfork", "clone"]
 
 
 # =====================
@@ -191,6 +195,8 @@ REGEX_EXTRACT_EXE = re.compile(r' exe=("(?:.+?)"|\S+)')
 REGEX_EXTRACT_COM = re.compile(r" comm=(\S+)")
 # subj=unconfined_u:system_r:myapp_t:s0-s0:c0.c1023
 REGEX_EXTRACT_SUBJ = re.compile(r" subj=(\S+)")
+# exit=12345 (from SYSCALL line, used for fork/vfork/clone to get child PID)
+REGEX_EXTRACT_EXIT = re.compile(r" exit=(\S+)")
 # msg=audit(07/09/2024 16:38:22.104:7145) OR msg=audit(1720536502.104:7145)
 REGEX_EXTRACT_MSG_AUDIT = re.compile(r"msg=audit\(([^)]+)\)")
 # argc=3 a0="/bin/bash" a1="-c" a2="echo hello"
@@ -1578,109 +1584,148 @@ class Analyzer:
 
     def parse_execve_logs(self):
         """
-        Parse EXECVE syscalls from audit logs to build a PID tree.
+        Parse process-creation syscalls from audit logs to build a PID tree.
+        Handles both exec-family (execve, execveat) and fork-family (fork, vfork, clone).
         Uses streaming (Popen) to avoid loading the entire ausearch output into memory.
-        Returns the number of EXECVE entries processed.
+        Returns the number of entries processed.
+
+        For exec-family: pid/ppid come from the SYSCALL record, command from EXECVE args.
+        For fork-family: the parent is the SYSCALL pid, the child PID is the exit value,
+        and the command is inherited from the parent (extracted from PROCTITLE or comm).
         """
-        execve_count = 0
-        cmd = ["/usr/sbin/ausearch", "-i", "-m", "syscall", "-sc", "execve", "-if", self.log_path]
+        entry_count = 0
 
         if self.show_debug:
             print(f"[parse_execve_logs] log_path: {self.log_path}", file=sys.stderr)
 
         reused_pids = set()
         block_num = 0
-        try:
-            for block in self._iter_subprocess_blocks(cmd):
-                block_num += 1
-                if not block.strip():
-                    continue
 
-                # Check for EXECVE type in the block (to confirm it's an execve syscall)
-                if "type=EXECVE" not in block and "EXECVE" not in block:
-                    if self.show_debug and block_num <= 3:
-                        print(f"[parse_execve_logs] Block {block_num}: no EXECVE found, first 200 chars: {block[:200]}", file=sys.stderr)
-                    continue
+        for syscall_name in PID_TREE_SYSCALLS:
+            is_fork = syscall_name in FORK_SYSCALLS
+            ausearch_cmd = ["/usr/sbin/ausearch", "-i", "-m", "syscall", "-sc", syscall_name, "-if", self.log_path]
 
-                # Skip if already analyzed (when state file is used)
-                if self.state_file_path and self.is_entry_analyzed(block):
+            if self.show_debug:
+                print(f"[parse_execve_logs] searching for syscall={syscall_name}", file=sys.stderr)
+
+            try:
+                for block in self._iter_subprocess_blocks(ausearch_cmd):
+                    block_num += 1
+                    if not block.strip():
+                        continue
+
+                    # For exec-family, confirm the block has EXECVE args
+                    if not is_fork:
+                        if "type=EXECVE" not in block and "EXECVE" not in block:
+                            if self.show_debug and block_num <= 3:
+                                print(f"[parse_execve_logs] Block {block_num} ({syscall_name}): no EXECVE found, first 200 chars: {block[:200]}", file=sys.stderr)
+                            continue
+
+                    # Skip if already analyzed (when state file is used)
+                    if self.state_file_path and self.is_entry_analyzed(block):
+                        if self.show_debug:
+                            print(f"[parse_execve_logs] Block {block_num} ({syscall_name}): already analyzed, skipping", file=sys.stderr)
+                        continue
+
+                    msg_match = REGEX_EXTRACT_MSG_AUDIT.search(block)
+                    if not msg_match:
+                        if self.show_debug:
+                            print(f"[parse_execve_logs] Block {block_num} ({syscall_name}): no msg_match", file=sys.stderr)
+                        continue
+
+                    # Extract pid, ppid from SYSCALL line
+                    pid_ppid_match = REGEX_EXTRACT_PID_PPID.search(block)
+                    if not pid_ppid_match:
+                        if self.show_debug:
+                            print(f"[parse_execve_logs] Block {block_num} ({syscall_name}): no pid_ppid_match", file=sys.stderr)
+                        continue
+
+                    # Extract SELinux context from subj=
+                    subj_match = REGEX_EXTRACT_SUBJ.search(block)
+                    context = subj_match.group(1) if subj_match else UNKNOWN
+
+                    if is_fork:
+                        # Fork-family: pid field is the parent, exit field is the child PID
+                        exit_match = REGEX_EXTRACT_EXIT.search(block)
+                        if not exit_match:
+                            if self.show_debug:
+                                print(f"[parse_execve_logs] Block {block_num} ({syscall_name}): no exit= field", file=sys.stderr)
+                            continue
+                        try:
+                            child_pid = int(exit_match.group(1))
+                        except ValueError:
+                            if self.show_debug:
+                                print(f"[parse_execve_logs] Block {block_num} ({syscall_name}): non-numeric exit={exit_match.group(1)}", file=sys.stderr)
+                            continue
+                        if child_pid <= 0:
+                            if self.show_debug:
+                                print(f"[parse_execve_logs] Block {block_num} ({syscall_name}): exit={child_pid} <= 0, skipping", file=sys.stderr)
+                            continue
+                        pid = child_pid
+                        ppid = int(pid_ppid_match.group(2))  # SYSCALL pid = parent
+                        # Command inherited from parent: extract from PROCTITLE or comm
+                        proctitle_match = REGEX_EXTRACT_PROCTITLE.search(block)
+                        if proctitle_match:
+                            entry_cmd = proctitle_match.group(1).strip()
+                        else:
+                            com_match = REGEX_EXTRACT_COM.search(block)
+                            entry_cmd = com_match.group(1) if com_match else UNKNOWN
+                    else:
+                        # Exec-family: standard extraction
+                        pid = int(pid_ppid_match.group(2))
+                        ppid = int(pid_ppid_match.group(1))
+                        entry_cmd = extract_execve_command(block)
+                        if not entry_cmd:
+                            entry_cmd = UNKNOWN
+
                     if self.show_debug:
-                        print(f"[parse_execve_logs] Block {block_num}: already analyzed, skipping", file=sys.stderr)
-                    continue
+                        print(f"[parse_execve_logs] Block {block_num} ({syscall_name}): PROCESSING pid={pid} ppid={ppid}", file=sys.stderr)
 
-                msg_match = REGEX_EXTRACT_MSG_AUDIT.search(block)
-                if not msg_match:
-                    if self.show_debug:
-                        print(f"[parse_execve_logs] Block {block_num}: no msg_match", file=sys.stderr)
-                    continue
+                    pk = (pid, self.key)
+                    ppid_pk = (ppid, self.key)
 
-                # Extract pid, ppid from SYSCALL line
-                pid_ppid_match = REGEX_EXTRACT_PID_PPID.search(block)
-                if not pid_ppid_match:
-                    if self.show_debug:
-                        print(f"[parse_execve_logs] Block {block_num}: no pid_ppid_match", file=sys.stderr)
-                    continue
+                    # Add to PID tree
+                    if pk not in self.pid_tree:
+                        self.pid_tree[pk] = PidTreeEntry(
+                            cmd=entry_cmd, ppid=ppid, context=context,
+                            key=self.key, live=True,
+                        )
+                    else:
+                        # Detect PID reuse: ppid changed → remove pk from old parent's children
+                        old_ppid = self.pid_tree[pk].ppid
+                        if old_ppid is not None and ppid != old_ppid:
+                            old_ppid_pk = (old_ppid, self.key)
+                            if old_ppid_pk in self.pid_tree and pk in self.pid_tree[old_ppid_pk].children:
+                                self.pid_tree[old_ppid_pk].children.remove(pk)
+                            reused_pids.add(pid)
+                            # Force-update ppid: merge() won't overwrite a known value
+                            self.pid_tree[pk].ppid = ppid
+                        # Update existing entry with more info
+                        self.pid_tree[pk].merge(PidTreeEntry(
+                            cmd=entry_cmd, ppid=ppid, context=context,
+                            key=self.key, live=True,
+                        ))
 
-                if self.show_debug:
-                    print(f"[parse_execve_logs] Block {block_num}: PROCESSING - has EXECVE, msg, pid/ppid", file=sys.stderr)
+                    # Add this pid as child of its parent
+                    if ppid and ppid_pk in self.pid_tree:
+                        if pk not in self.pid_tree[ppid_pk].children:
+                            self.pid_tree[ppid_pk].children.append(pk)
+                    elif ppid:
+                        # Parent doesn't exist yet, create placeholder
+                        self.pid_tree[ppid_pk] = PidTreeEntry(
+                            cmd=UNKNOWN, ppid=None, context=UNKNOWN,
+                            key=self.key, live=True, children=[pk],
+                        )
 
-                pid = int(pid_ppid_match.group(2))
-                ppid = int(pid_ppid_match.group(1))
-
-                # Extract SELinux context from subj=
-                subj_match = REGEX_EXTRACT_SUBJ.search(block)
-                context = subj_match.group(1) if subj_match else UNKNOWN
-
-                # Extract command from EXECVE args
-                cmd = extract_execve_command(block)
-                if not cmd:
-                    cmd = UNKNOWN
-
-                pk = (pid, self.key)
-                ppid_pk = (ppid, self.key)
-
-                # Add to PID tree
-                if pk not in self.pid_tree:
-                    self.pid_tree[pk] = PidTreeEntry(
-                        cmd=cmd, ppid=ppid, context=context,
-                        key=self.key, live=True,
-                    )
-                else:
-                    # Detect PID reuse: ppid changed → remove pk from old parent's children
-                    old_ppid = self.pid_tree[pk].ppid
-                    if old_ppid is not None and ppid != old_ppid:
-                        old_ppid_pk = (old_ppid, self.key)
-                        if old_ppid_pk in self.pid_tree and pk in self.pid_tree[old_ppid_pk].children:
-                            self.pid_tree[old_ppid_pk].children.remove(pk)
-                        reused_pids.add(pid)
-                        # Force-update ppid: merge() won't overwrite a known value
-                        self.pid_tree[pk].ppid = ppid
-                    # Update existing entry with more info
-                    self.pid_tree[pk].merge(PidTreeEntry(
-                        cmd=cmd, ppid=ppid, context=context,
-                        key=self.key, live=True,
-                    ))
-
-                # Add this pid as child of its parent
-                if ppid and ppid_pk in self.pid_tree:
-                    if pk not in self.pid_tree[ppid_pk].children:
-                        self.pid_tree[ppid_pk].children.append(pk)
-                elif ppid:
-                    # Parent doesn't exist yet, create placeholder
-                    self.pid_tree[ppid_pk] = PidTreeEntry(
-                        cmd=UNKNOWN, ppid=None, context=UNKNOWN,
-                        key=self.key, live=True, children=[pk],
-                    )
-
-                self.mark_entry_analyzed(block)
-                execve_count += 1
-        except subprocess.TimeoutExpired:
-            print(f"Warning: ausearch timed out after {SUBPROCESS_TIMEOUT}s while parsing EXECVE logs", file=sys.stderr)
-        except Exception as e:
-            print(f"Warning: Could not fetch EXECVE logs: {e}", file=sys.stderr)
+                    self.mark_entry_analyzed(block)
+                    entry_count += 1
+            except subprocess.TimeoutExpired:
+                print(f"Warning: ausearch timed out after {SUBPROCESS_TIMEOUT}s while parsing {syscall_name} logs", file=sys.stderr)
+            except Exception as e:
+                print(f"Warning: Could not fetch {syscall_name} logs: {e}", file=sys.stderr)
 
         if block_num == 0 and (self.show_info or self.show_debug):
-            print(f"No EXECVE events found in audit logs (log_path={self.log_path})", file=sys.stderr)
+            print(f"No process-creation events found in audit logs (log_path={self.log_path})", file=sys.stderr)
 
         if reused_pids:
             sorted_pids = sorted(reused_pids)
@@ -1698,7 +1743,7 @@ class Analyzer:
                       f"PID tree data for the earlier incarnation of these processes is lost.",
                       file=sys.stderr)
 
-        return execve_count
+        return entry_count
 
     def filter_pid_tree(self):
         """Filter pid_tree to keep only processes linked to an AVC denial.
@@ -2262,11 +2307,11 @@ class Analyzer:
             if self.show_info and skipped_avc_count:
                 print(f"Skipped {skipped_avc_count} already analyzed AVC entries", file=sys.stderr)
 
-            # Parse EXECVE logs and build PID tree
+            # Parse process-creation logs and build PID tree
             if self.show_pid_tree:
                 execve_count = self.parse_execve_logs()
                 if self.show_info:
-                    print(f"Processed {execve_count} EXECVE events for PID tree", file=sys.stderr)
+                    print(f"Processed {execve_count} process-creation events for PID tree", file=sys.stderr)
 
             # Filter PID tree before enrichment: prune placeholder ancestors
             # that are unknown (would otherwise be enriched with irrelevant

@@ -35,7 +35,7 @@ Analyzes SELinux audit logs (from `/var/log/audit/audit.log`) and generates poli
 - aureport
 - ausearch
 - audit2allow
-- se_log_analyser use auditd execve logs (`auditctl -a always,exit -S execve`)
+- se_log_analyser use auditd execve logs (`auditctl -a always,exit -S execve -S execveat -S fork -S vfork -S clone`)
 
 **Usage Examples:**
 

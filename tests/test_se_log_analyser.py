@@ -6391,7 +6391,7 @@ class TestParseExecveLogs:
         with mock.patch.object(a, "_iter_subprocess_blocks", return_value=iter([])):
             count = a.parse_execve_logs()
         assert count == 0
-        assert "No EXECVE events found" in capsys.readouterr().err
+        assert "No process-creation events found" in capsys.readouterr().err
 
     def test_timeout_handled(self, capsys):
         """TimeoutExpired during _iter_subprocess_blocks is caught."""
