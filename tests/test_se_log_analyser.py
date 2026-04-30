@@ -425,7 +425,10 @@ class TestGetBaseCmd:
         assert cla.get_base_cmd("/bin/bash /bin/myapp -s") == "MYAPP"
 
     def test_bash_with_flag(self):
-        assert cla.get_base_cmd("bash -c echo hello") == "BASH"
+        assert cla.get_base_cmd("bash -c echo hello") == "ECHO"
+
+    def test_bash_with_flag_no_script(self):
+        assert cla.get_base_cmd("bash -c -falseFlag") == "BASH"
 
     def test_list_input(self):
         assert cla.get_base_cmd(["podman", "info"]) == "PODMAN"
@@ -1083,7 +1086,7 @@ class TestRegexPatterns:
 
     def test_allow_rule_regex(self):
         line = "myapp_t cert_t:dir getattr;"
-        m = cla.REGEX_ALLOW_RULE.search(line)
+        m = cla.REGEX_SINGLE_RULE_CONTENT.search(line)
         assert m is not None
         assert m.group(1) == "myapp_t"
         assert m.group(2) == "cert_t"
@@ -6526,7 +6529,7 @@ class TestParseExistingFileEdgeCases:
     def test_unparseable_block_error(self, capsys):
         """Block that matches neither AVC rule nor cmd section (line 1300)."""
         a = cla.Analyzer(key="t", look_in_log=False)
-        # Extra \nallow to create a second block that doesn't match REGEX_ALLOW_RULE
+        # Extra \nallow to create a second block that doesn't match REGEX_SINGLE_RULE_CONTENT
         doc = (
             f"\nallow src_t tgt_t:file read;\n"
             f"{cla.PREFIX_CMD_LINE}# required by :\n"
@@ -7014,3 +7017,372 @@ class TestCLI:
         assert sf.exists()
         data = json.loads(sf.read_text())
         assert "analyzed_entries" in data
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# UNIT TESTS — load_whitelist
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.unit
+class TestLoadWhitelist:
+    """Unit tests for load_whitelist()."""
+
+    def test_single_method_rule(self, tmp_path):
+        """Single-method allow rule is parsed to a one-element frozenset."""
+        wl = tmp_path / "wl.te"
+        wl.write_text("allow myapp_t cert_t:dir search;\n")
+        result = cla.load_whitelist(str(wl))
+        assert ("myapp_t", "cert_t", "dir", "search") in result
+        assert len(result) == 1
+
+    def test_multi_method_rule(self, tmp_path):
+        """Multi-method { } rule expands to one tuple per method."""
+        wl = tmp_path / "wl.te"
+        wl.write_text("allow myapp_t bin_t:file { read execute };\n")
+        result = cla.load_whitelist(str(wl))
+        assert ("myapp_t", "bin_t", "file", "read") in result
+        assert ("myapp_t", "bin_t", "file", "execute") in result
+        assert len(result) == 2
+
+    def test_comments_and_blank_lines_ignored(self, tmp_path):
+        """Lines starting with '#' and blank lines are skipped."""
+        wl = tmp_path / "wl.te"
+        wl.write_text(
+            "# this is a comment\n"
+            "\n"
+            "allow myapp_t tmp_t:file write;\n"
+            "# another comment\n"
+            "\n"
+        )
+        result = cla.load_whitelist(str(wl))
+        assert len(result) == 1
+        assert ("myapp_t", "tmp_t", "file", "write") in result
+
+    def test_multiple_rules_mixed(self, tmp_path):
+        """Mix of single and multi-method rules all parsed correctly."""
+        wl = tmp_path / "wl.te"
+        wl.write_text(
+            "allow myapp_t cert_t:dir search;\n"
+            "allow myapp_t bin_t:file { read execute };\n"
+            "allow myapp_t tmp_t:file write;\n"
+        )
+        result = cla.load_whitelist(str(wl))
+        assert len(result) == 4
+        assert ("myapp_t", "cert_t", "dir", "search") in result
+        assert ("myapp_t", "bin_t", "file", "read") in result
+        assert ("myapp_t", "bin_t", "file", "execute") in result
+        assert ("myapp_t", "tmp_t", "file", "write") in result
+
+    def test_returns_frozenset(self, tmp_path):
+        """Return type is frozenset (immutable, hashable)."""
+        wl = tmp_path / "wl.te"
+        wl.write_text("allow myapp_t cert_t:dir search;\n")
+        result = cla.load_whitelist(str(wl))
+        assert isinstance(result, frozenset)
+
+    def test_empty_file(self, tmp_path):
+        """Empty whitelist file returns empty frozenset."""
+        wl = tmp_path / "wl.te"
+        wl.write_text("")
+        result = cla.load_whitelist(str(wl))
+        assert result == frozenset()
+
+    def test_only_comments(self, tmp_path):
+        """File with only comments returns empty frozenset."""
+        wl = tmp_path / "wl.te"
+        wl.write_text("# just a comment\n# another\n")
+        result = cla.load_whitelist(str(wl))
+        assert result == frozenset()
+
+    def test_duplicate_rules_deduplicated(self, tmp_path):
+        """Duplicate rules appear only once in the frozenset."""
+        wl = tmp_path / "wl.te"
+        wl.write_text(
+            "allow myapp_t cert_t:dir search;\n"
+            "allow myapp_t cert_t:dir search;\n"
+        )
+        result = cla.load_whitelist(str(wl))
+        assert len(result) == 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# UNIT TESTS — filter_AVC with whitelist
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.unit
+class TestFilterAVCWithWhitelist:
+    """Unit tests for filter_AVC() whitelist behaviour."""
+
+    def _wl(self, *tuples):
+        """Build a frozenset whitelist from (src, tgt, tclass, method) tuples."""
+        return frozenset(tuples)
+
+    def test_whitelisted_avc_removed(self):
+        """An AVC whose rule is in the whitelist is removed from the result."""
+        wl = self._wl(("myapp_t", "cert_t", "dir", "search"))
+        a = cla.Analyzer(key="test", look_in_log=False, whitelist=wl)
+        result = cla.AnalysisResult(
+            command=cla.CommandContext(key="test"),
+            avc_list=[cla.AvcDenial("myapp_t", "cert_t", "dir", "search")],
+        )
+        assert a.filter_AVC(result) is False
+        assert len(result.avc_list) == 0
+
+    def test_non_whitelisted_avc_kept(self):
+        """An AVC not in the whitelist is not removed."""
+        wl = self._wl(("myapp_t", "cert_t", "dir", "search"))
+        a = cla.Analyzer(key="test", look_in_log=False, whitelist=wl)
+        result = cla.AnalysisResult(
+            command=cla.CommandContext(key="test"),
+            avc_list=[cla.AvcDenial("myapp_t", "tmp_t", "file", "write")],
+        )
+        assert a.filter_AVC(result) is True
+        assert len(result.avc_list) == 1
+
+    def test_partial_whitelist_mixed_avcs(self):
+        """Only whitelisted AVCs are removed; others are kept."""
+        wl = self._wl(("myapp_t", "cert_t", "dir", "search"))
+        a = cla.Analyzer(key="test", look_in_log=False, whitelist=wl)
+        result = cla.AnalysisResult(
+            command=cla.CommandContext(key="test"),
+            avc_list=[
+                cla.AvcDenial("myapp_t", "cert_t", "dir", "search"),
+                cla.AvcDenial("myapp_t", "tmp_t", "file", "write"),
+            ],
+        )
+        assert a.filter_AVC(result) is True
+        assert len(result.avc_list) == 1
+        assert result.avc_list[0].target_type == "tmp_t"
+
+    def test_empty_whitelist_keeps_all(self):
+        """An empty whitelist has no effect."""
+        a = cla.Analyzer(key="test", look_in_log=False, whitelist=frozenset())
+        result = cla.AnalysisResult(
+            command=cla.CommandContext(key="test"),
+            avc_list=[cla.AvcDenial("myapp_t", "cert_t", "dir", "search")],
+        )
+        assert a.filter_AVC(result) is True
+
+    def test_whitelist_and_context_filter_combined(self):
+        """With both filters active, an AVC must pass context_filter AND not be in whitelist."""
+        wl = self._wl(("myapp_t", "cert_t", "dir", "search"))
+        a = cla.Analyzer(key="test", look_in_log=False,
+                         context_filter=["myapp_t"], whitelist=wl)
+        result = cla.AnalysisResult(
+            command=cla.CommandContext(key="test"),
+            avc_list=[
+                # matches context filter but is whitelisted → removed
+                cla.AvcDenial("myapp_t", "cert_t", "dir", "search"),
+                # matches context filter and not whitelisted → kept
+                cla.AvcDenial("myapp_t", "tmp_t", "file", "write"),
+                # fails context filter → removed
+                cla.AvcDenial("httpd_t", "var_t", "file", "read"),
+            ],
+        )
+        assert a.filter_AVC(result) is True
+        assert len(result.avc_list) == 1
+        assert result.avc_list[0].target_type == "tmp_t"
+
+    def test_whitelist_match_is_exact(self):
+        """Whitelist match requires exact (src, tgt, tclass, method) — no wildcards."""
+        wl = self._wl(("myapp_t", "cert_t", "dir", "search"))
+        a = cla.Analyzer(key="test", look_in_log=False, whitelist=wl)
+        # Different method — should NOT be filtered
+        result = cla.AnalysisResult(
+            command=cla.CommandContext(key="test"),
+            avc_list=[cla.AvcDenial("myapp_t", "cert_t", "dir", "read")],
+        )
+        assert a.filter_AVC(result) is True
+
+    def test_whitelist_all_avcs_removed_returns_false(self):
+        """When all AVCs are whitelisted the result is discarded (returns False)."""
+        wl = self._wl(
+            ("myapp_t", "cert_t", "dir", "search"),
+            ("myapp_t", "tmp_t", "file", "write"),
+        )
+        a = cla.Analyzer(key="test", look_in_log=False, whitelist=wl)
+        result = cla.AnalysisResult(
+            command=cla.CommandContext(key="test"),
+            avc_list=[
+                cla.AvcDenial("myapp_t", "cert_t", "dir", "search"),
+                cla.AvcDenial("myapp_t", "tmp_t", "file", "write"),
+            ],
+        )
+        assert a.filter_AVC(result) is False
+        assert len(result.avc_list) == 0
+
+    def test_no_filter_no_whitelist_keeps_everything(self):
+        """No context_filter and empty whitelist: early return True, nothing removed."""
+        a = cla.Analyzer(key="test", look_in_log=False)
+        result = cla.AnalysisResult(
+            command=cla.CommandContext(key="test"),
+            avc_list=[cla.AvcDenial("sshd_t", "unlabeled_t", "file", "read")],
+        )
+        assert a.filter_AVC(result) is True
+        assert len(result.avc_list) == 1
+
+    def test_whitelist_counter_incremented(self):
+        """whitelist_counter tracks the number of AVCs suppressed by the whitelist."""
+        wl = self._wl(
+            ("myapp_t", "cert_t", "dir", "search"),
+            ("myapp_t", "tmp_t", "file", "write"),
+        )
+        a = cla.Analyzer(key="test", look_in_log=False, whitelist=wl)
+        result = cla.AnalysisResult(
+            command=cla.CommandContext(key="test"),
+            avc_list=[
+                cla.AvcDenial("myapp_t", "cert_t", "dir", "search"),
+                cla.AvcDenial("myapp_t", "tmp_t", "file", "write"),
+                cla.AvcDenial("myapp_t", "bin_t", "file", "read"),  # not whitelisted
+            ],
+        )
+        a.filter_AVC(result)
+        assert a.whitelist_counter == 2
+        assert len(result.avc_list) == 1  # only non-whitelisted survives
+
+    def test_whitelist_counter_not_incremented_for_context_filter_removals(self):
+        """AVCs removed by context_filter do not increment whitelist_counter."""
+        wl = self._wl(("myapp_t", "cert_t", "dir", "search"))
+        a = cla.Analyzer(key="test", look_in_log=False,
+                         context_filter=["myapp_t"], whitelist=wl)
+        result = cla.AnalysisResult(
+            command=cla.CommandContext(key="test"),
+            avc_list=[
+                cla.AvcDenial("httpd_t", "var_t", "file", "read"),  # removed by context_filter
+            ],
+        )
+        a.filter_AVC(result)
+        assert a.whitelist_counter == 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# INTEGRATION TESTS — whitelist applied during parse_ausearch_from_log
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.unit
+class TestWhitelistIntegration:
+    """Integration tests: whitelist filters AVCs during parse_ausearch_from_log."""
+
+    _BLOCK = (
+        "type=AVC msg=audit(1234567890.000:100) : "
+        "avc:  denied  { read } for  pid=1001 "
+        "scontext=system_u:system_r:myapp_t:s0 "
+        "tcontext=system_u:object_r:cert_t:s0 tclass=file\n"
+        "type=SYSCALL msg=audit(1234567890.000:100) : arch=x86_64 syscall=openat "
+        "ppid=1000 pid=1001 "
+        "comm=myapp exe=/usr/sbin/myapp "
+        "subj=system_u:system_r:myapp_t:s0 key=(null)"
+    )
+
+    def test_whitelisted_avc_excluded_from_results(self):
+        """An AVC block that exactly matches the whitelist produces no results."""
+        wl = frozenset({("myapp_t", "cert_t", "file", "read")})
+        a = cla.Analyzer(key="test", look_in_log=False, whitelist=wl)
+        results = a.parse_ausearch_from_log(blocks=[self._BLOCK])
+        assert results == []
+        # avc_counter still increments before filtering
+        assert a.avc_counter == 1
+        # whitelist_counter tracks how many AVCs were suppressed
+        assert a.whitelist_counter == 1
+
+    def test_non_whitelisted_avc_appears_in_results(self):
+        """An AVC block not in the whitelist is kept in results."""
+        wl = frozenset({("myapp_t", "bin_t", "file", "execute")})  # different rule
+        a = cla.Analyzer(key="test", look_in_log=False, whitelist=wl)
+        results = a.parse_ausearch_from_log(blocks=[self._BLOCK])
+        assert len(results) == 1
+        assert results[0].avc_list[0].source_type == "myapp_t"
+        assert results[0].avc_list[0].target_type == "cert_t"
+        assert a.whitelist_counter == 0
+
+    def test_empty_whitelist_passes_avc_through(self):
+        """Empty whitelist does not filter anything."""
+        a = cla.Analyzer(key="test", look_in_log=False, whitelist=frozenset())
+        results = a.parse_ausearch_from_log(blocks=[self._BLOCK])
+        assert len(results) == 1
+        assert a.whitelist_counter == 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CLI TESTS — --white-list argument
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.cli
+class TestCLIWhiteList:
+    """CLI tests for --white-list argument."""
+
+    _LOG_AVC = (
+        'type=AVC msg=audit(1234567890.000:100) : avc:  denied  { read } for '
+        'pid=1001 scontext=system_u:system_r:myapp_t:s0 '
+        'tcontext=system_u:object_r:cert_t:s0 tclass=file\n'
+    )
+
+    def _run(self, tmp_path, extra_args, log_content=None):
+        log_file = str(tmp_path / "test.log")
+        with open(log_file, "w") as f:
+            f.write(log_content or self._LOG_AVC)
+        dest = str(tmp_path / "output.txt")
+        cmd = [sys.executable, _SCRIPT_PATH,
+               "--key", "test", "--log", log_file, "--no-tree", "--dest", dest]
+        cmd += extra_args
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        out = open(dest).read() if os.path.exists(dest) else ""
+        return result, out
+
+    @needs_ausearch
+    def test_whitelist_filters_matching_rule(self, tmp_path):
+        """When the AVC matches a whitelist rule it must not appear in output."""
+        wl = tmp_path / "wl.te"
+        wl.write_text("allow myapp_t cert_t:file read;\n")
+        result, out = self._run(tmp_path, ["--white-list", str(wl)])
+        assert result.returncode == 0
+        assert "allow myapp_t cert_t:file read;" not in out
+
+    @needs_ausearch
+    def test_whitelist_keeps_non_matching_rule(self, tmp_path):
+        """When the AVC does not match the whitelist it must appear in output."""
+        wl = tmp_path / "wl.te"
+        wl.write_text("allow myapp_t bin_t:file execute;\n")  # different rule
+        result, out = self._run(tmp_path, ["--white-list", str(wl)])
+        assert result.returncode == 0
+        assert "allow myapp_t cert_t:file read;" in out
+
+    def test_missing_whitelist_file_exits_nonzero(self, tmp_path):
+        """A --white-list path that does not exist should cause non-zero exit."""
+        result, _ = self._run(tmp_path, ["--white-list", str(tmp_path / "nonexistent.te")])
+        assert result.returncode != 0
+
+    @needs_ausearch
+    def test_empty_whitelist_file_no_filtering(self, tmp_path):
+        """An empty whitelist file applies no filtering."""
+        wl = tmp_path / "wl.te"
+        wl.write_text("")
+        result, out = self._run(tmp_path, ["--white-list", str(wl)])
+        assert result.returncode == 0
+        assert "allow myapp_t cert_t:file read;" in out
+
+    def test_whitelist_help_mentioned(self):
+        """--white-list should appear in --help output."""
+        result = subprocess.run(
+            [sys.executable, _SCRIPT_PATH, "--help"],
+            capture_output=True, text=True,
+        )
+        assert "--white-list" in result.stdout
+
+    @needs_ausearch
+    def test_whitelist_counter_in_stderr(self, tmp_path):
+        """When AVCs are suppressed, the count appears in the final stderr summary."""
+        wl = tmp_path / "wl.te"
+        wl.write_text("allow myapp_t cert_t:file read;\n")
+        result, _ = self._run(tmp_path, ["--white-list", str(wl)])
+        assert result.returncode == 0
+        assert "suppressed by whitelist" in result.stderr
+
+    @needs_ausearch
+    def test_no_whitelist_counter_in_stderr_when_zero(self, tmp_path):
+        """When nothing is suppressed, the whitelist counter is absent from stderr."""
+        wl = tmp_path / "wl.te"
+        wl.write_text("allow myapp_t bin_t:file execute;\n")  # doesn't match
+        result, _ = self._run(tmp_path, ["--white-list", str(wl)])
+        assert result.returncode == 0
+        assert "suppressed by whitelist" not in result.stderr

@@ -54,6 +54,9 @@ se_log_analyser --key $hostname --log ./logs --json-dest ./output.json
 
 # Mixed: human-readable files + JSON files as input, both outputs
 se_log_analyser --key $hostname --files rules.txt --json-files prev.json --dest merged.txt --json-dest merged.json
+
+# Suppress known-good rules (white-list)
+se_log_analyser --key $hostname --log ./logs --white-list ./avc_white_list --dest new_rules.txt
 ```
 
 **Limitations:**

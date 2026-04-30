@@ -57,6 +57,13 @@
 ## Usage: --files file1 file2 ... (each file as a separate argument)
 ##
 ## Log Memory: The script remembers which audit log entries have been analyzed (using --state-file) to avoid reprocessing.
+##
+## White-list: Known-good rules can be suppressed from the output with --white-list.
+##   The file follows standard SELinux allow-rule syntax (single-method or multi-method { } form):
+##     allow myapp_t cert_t:dir search;
+##     allow myapp_t bin_t:file { read execute };
+##   Matching AVCs are removed at Phase 1 (same stage as --context-filter), so they never
+##   appear in the output and do not inflate the command index.
 ######
 
 ######
@@ -77,6 +84,9 @@
 ##
 ## Mixed: human-readable files + JSON files as input, both outputs:
 ## se_log_analyser --key $hostname --files rules.txt --json-files prev.json --dest merged.txt --json-dest merged.json
+##
+## Suppress known-good rules using a white-list file:
+## se_log_analyser --key $hostname --log ./logs --white-list ./known_good_avc --dest new_rules.txt
 ######
 
 
@@ -222,9 +232,13 @@ REGEX_PID_TREE_ROOT = re.compile(r"(?:APP Roots? detected at|root:)\s+([\d,\s]+)
 # pid=23944@Rocky  ->  extract the key part after @
 REGEX_PID_TREE_KEY = re.compile(r"pid=\d+@(\S+)")
 # myapp_t myapp_t:file open;
-REGEX_ALLOW_RULE = re.compile(r"(\S+) (\S+):(\S+) (\S+);")
+REGEX_SINGLE_RULE_CONTENT = re.compile(r"(\S+) (\S+):(\S+) (\S+);")
 #     Debian_docker_v1 | RUNC_0001 (pid=3988 ; pid_ns=4026532289)
 REGEX_MAIN_EXPLANATION = re.compile(rf"(\S+) {re.escape(KEY_DELIMITER)} (.*) \(pid=([0-9]*) ; pid_ns=(\S+)\)")
+# allow myapp_t bin_t:file { read execute };
+REGEX_ALLOW_MULTI = re.compile(r"allow\s+(\S+)\s+(\S+):(\S+)\s+\{([^}]+)\}\s*;")
+# allow myapp_t user_home_t:dir search;
+REGEX_ALLOW_SINGLE = re.compile(r"allow\s+(\S+)\s+(\S+):(\S+)\s+(\S+)\s*;")
 
 
 # =====================
@@ -274,6 +288,34 @@ def get_entry_id(block):
         return match.group(1)
     # Fallback: hash the block content
     return hashlib.sha256(block.encode()).hexdigest()
+
+
+def load_whitelist(whitelist_path):
+    """Parse a whitelist file containing SELinux allow rules.
+
+    Returns a frozenset of (source_type, target_type, tclass, method) tuples.
+    Supports both single-method format and multi-method { } format:
+        allow myapp_t bin_t:file { read execute };
+        allow myapp_t user_home_t:dir search;
+
+    Lines starting with '#' and blank lines are ignored.
+    """
+    whitelist = set()
+    with open(whitelist_path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            m = REGEX_ALLOW_MULTI.search(line)
+            if m:
+                src, tgt, tclass = m.group(1), m.group(2), m.group(3)
+                for method in m.group(4).split():
+                    whitelist.add((src, tgt, tclass, method))
+            else:
+                m = REGEX_ALLOW_SINGLE.search(line)
+                if m:
+                    whitelist.add((m.group(1), m.group(2), m.group(3), m.group(4)))
+    return frozenset(whitelist)
 
 
 def extract_execve_command(block):
@@ -743,7 +785,8 @@ class Analyzer:
     def __init__(self, key=UNKNOWN, log_path=None, show_explanations=True,
                  look_in_log=True, show_debug=False, show_info=False,
                  state_file_path=None, show_pid_tree=True,
-                 context_filter=None, app_name=None, no_index=False):
+                 context_filter=None, app_name=None, no_index=False,
+                 whitelist=None):
         # Options
         self.key = key
         self.log_path = log_path or DEFAULT_LOG_PATH
@@ -756,10 +799,12 @@ class Analyzer:
         self.context_filter = context_filter  # SELinux types to filter on (e.g. ["myapp_t"])
         self.app_name = app_name              # app name for root PID detection (e.g. "myapp")
         self.no_index = no_index         # skip all command/namespace indexation
+        self.whitelist = whitelist or frozenset()  # (source_type, target_type, tclass, method) tuples to exclude
 
         # Counters
         self.avc_counter = 0
         self.file_counter = 0
+        self.whitelist_counter = 0    # AVCs suppressed by --white-list
         self.pid_tree_found = 0       # total PIDs in tree before AVC-relevance filtering
 
         # Indexing state
@@ -906,16 +951,21 @@ class Analyzer:
 
     def filter_AVC(self, result):
         """filter if we want the result object (from parse_ausearch_from_log) in our policy.
-        When context_filter is set, only keeps AVCs where source or target matches."""
+        When context_filter is set, only keeps AVCs where source or target matches.
+        When whitelist is set, removes AVCs whose allow rule is present in the whitelist."""
         if self.show_debug:
             snapshot = json.dumps(result, default=str)
-        if not self.context_filter:
+        if not self.context_filter and not self.whitelist:
             return True  # no filter configured, keep all AVCs
         avc_to_remove = []
         for avc in result.avc_list:
             # see philosophical discussion #1768
-            if avc.source_type not in self.context_filter and avc.target_type not in self.context_filter:
+            if self.context_filter and avc.source_type not in self.context_filter and avc.target_type not in self.context_filter:
                 avc_to_remove.append(avc)
+                continue
+            if self.whitelist and (avc.source_type, avc.target_type, avc.tclass, avc.method) in self.whitelist:
+                avc_to_remove.append(avc)
+                self.whitelist_counter += 1
         for avc in avc_to_remove:
             result.avc_list.remove(avc)
         if len(result.avc_list) == 0:
@@ -1246,7 +1296,7 @@ class Analyzer:
         if len(part) != 2:
             raise FileParsingError("error parsing a file, INDEX not found")
         for block in part[0].split("\nallow"):
-            avc_match = REGEX_ALLOW_RULE.search(block)
+            avc_match = REGEX_SINGLE_RULE_CONTENT.search(block)
             if avc_match:
                 cmd_lines = block.split(PREFIX_CMD_LINE)[1:]
                 i, n, clines = 0, len(cmd_lines), {}
@@ -2441,6 +2491,7 @@ if __name__ == "__main__":
     parser.add_argument("--verbose", action="store_true", help="Show verbose info")
     parser.add_argument("--context-filter", nargs='+', help="SELinux type(s) to filter on (e.g. 'myapp_t' or 'myapp_t myapp2_t'). Only AVCs involving these types are kept.")
     parser.add_argument("--app-name", help="Application name for root PID detection (e.g. 'myapp'). Used with --context-filter to identify the app root process.")
+    parser.add_argument("--white-list", help="Path to a file containing SELinux allow rules to exclude from the output (one rule per line, single-method or '{ }' multi-method format)")
 
     args = parser.parse_args()
 
@@ -2483,6 +2534,15 @@ if __name__ == "__main__":
                 except json.JSONDecodeError as e:
                     raise FileParsingError(f"error parsing JSON file {file_path}: {e}")
 
+    # Load whitelist file
+    whitelist = frozenset()
+    if args.white_list:
+        if not os.path.isfile(args.white_list):
+            raise FileNotFoundError(f"white-list path '{args.white_list}' does not exist or is not a regular file")
+        if not os.access(args.white_list, os.R_OK):
+            raise PermissionError(f"white-list path '{args.white_list}' is not readable")
+        whitelist = load_whitelist(args.white_list)
+
     # Determine whether human-readable formatting is needed:
     # skip it only when --json-dest is given without --dest (no stdout output either)
     need_human = bool(args.dest) or not bool(args.json_dest)
@@ -2500,6 +2560,7 @@ if __name__ == "__main__":
         context_filter=args.context_filter,
         app_name=args.app_name,
         no_index=args.no_index,
+        whitelist=whitelist,
     )
 
     txt = analyzer.analyze(
@@ -2525,7 +2586,8 @@ if __name__ == "__main__":
         keys_in_tree[entry_key] = keys_in_tree.get(entry_key, 0) + 1
     key_summary = ", ".join(f"{k}={v}" for k, v in sorted(keys_in_tree.items()))
     pid_tree_summary = f"PID tree: {analyzer.pid_tree_found} found, {len(analyzer.pid_tree)} displayed ({key_summary})"
+    whitelist_summary = f" ; {analyzer.whitelist_counter} suppressed by whitelist" if analyzer.whitelist_counter else ""
     print(
-        f"{analyzer.avc_counter} AVC analyzed from logs ; {analyzer.file_counter} found in the existing files ; {pid_tree_summary}",
+        f"{analyzer.avc_counter} AVC analyzed from logs{whitelist_summary} ; {analyzer.file_counter} found in the existing files ; {pid_tree_summary}",
         file=sys.stderr,
     )
